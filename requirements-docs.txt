@@ -1,0 +1,14 @@
+sphinx>=7.2
+sphinx-copybutton>=0.5
+sphinx_rtd_theme>=2.0
+numpydoc>=1.6
+nbsphinx>=0.9
+ipython>=8.15
+ipykernel>=6.25
+jupyter>=1.0
+matplotlib>=3.7
+seaborn>=0.13
+pymc>=5.0
+arviz>=0.15
+POT>=0.9.3
+nbstripout>=0.6
