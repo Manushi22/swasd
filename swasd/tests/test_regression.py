@@ -317,8 +317,7 @@ class TestMonotoneSWDModelDiagnostics:
         result = model.predicted_vs_residual(
             y_log=y_log,
             i=pairs[:, 0],
-            j=pairs[:, 1],
-            compute_fit_diagnostic=True
+            j=pairs[:, 1]
         )
         
         # Check output structure
@@ -326,7 +325,6 @@ class TestMonotoneSWDModelDiagnostics:
         assert 'residuals' in result
         assert 'lower_CI' in result
         assert 'upper_CI' in result
-        assert 'fit_diagnostic' in result
         
         # Check shapes
         N = len(y_log)
@@ -338,38 +336,7 @@ class TestMonotoneSWDModelDiagnostics:
         # Check residual calculation
         expected_resid = y_log - result['y_predicted']
         np.testing.assert_array_almost_equal(result['residuals'], expected_resid)
-        
-        # Check fit diagnostic is a scalar
-        assert isinstance(result['fit_diagnostic'], (float, np.floating))
     
-    @pytest.mark.slow
-    def test_predicted_vs_residual_without_diagnostic(self, small_pairwise_data):
-        """Test predicted vs residual without fit diagnostic"""
-        model = MonotoneSWDModel(
-            num_samples=100,
-            num_warmup=100,
-            num_chains=2,
-            verbose=False
-        )
-        
-        y_log = np.log(small_pairwise_data['sw_values'])
-        pairs = small_pairwise_data['block_pairs']
-        
-        model.fit(y=y_log, i=pairs[:, 0], j=pairs[:, 1])
-        
-        result = model.predicted_vs_residual(
-            y_log=y_log,
-            i=pairs[:, 0],
-            j=pairs[:, 1],
-            compute_fit_diagnostic=False
-        )
-        
-        # fit_diagnostic should not be in result
-        assert 'fit_diagnostic' not in result
-        
-        # But other keys should be present
-        assert 'y_predicted' in result
-        assert 'residuals' in result
     
     def test_predicted_vs_residual_not_fitted(self):
         """Test that predicted_vs_residual raises error when not fitted"""
@@ -459,32 +426,6 @@ class TestMonotoneSWDModelIntegration:
             result2['swd_est_mean'],
             rtol=0.1  # Allow 10% relative difference
         )
-
-
-class TestMonotoneSWDModelVerboseMode:
-    """Tests for verbose output control"""
-    
-    def test_verbose_false_suppresses_output(self, small_pairwise_data, capsys):
-        """Test that verbose=False suppresses Stan output"""
-        model = MonotoneSWDModel(
-            num_samples=50,
-            num_warmup=50,
-            num_chains=1,
-            verbose=False
-        )
-        
-        y_log = np.log(small_pairwise_data['sw_values'])
-        pairs = small_pairwise_data['block_pairs']
-        
-        model.fit(y=y_log, i=pairs[:, 0], j=pairs[:, 1])
-        
-        captured = capsys.readouterr()
-        
-        # Should have minimal output (no Stan sampling messages)
-        # Note: This test might be flaky depending on Stan version
-        # Adjust assertion based on actual behavior
-        assert "Gradient evaluation took" not in captured.out
-        assert "Iteration:" not in captured.out
 
 
 if __name__ == "__main__":

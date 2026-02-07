@@ -145,7 +145,7 @@ class TestInitRhatParams:
 
     def test_defaults(self, samples):
         det = swasd(samples=samples)
-        assert det.rhat_threshold   == 1.1
+        assert det.rhat_threshold   == 1.01
         assert det.rhat_wmin        == 100
         assert det.rhat_method      == "rank"
         assert det.rhat_num_windows == 5
@@ -153,10 +153,10 @@ class TestInitRhatParams:
         assert det.rhat_check_iter  == 100
 
     def test_custom_values(self, samples):
-        det = swasd(samples, rhat_threshold=1.01, rhat_wmin=50,
+        det = swasd(samples, rhat_threshold=1.1, rhat_wmin=50,
                     rhat_method="split", rhat_num_windows=10,
                     rhat_stop_factor=2.0, rhat_check_iter=25)
-        assert det.rhat_threshold   == 1.01
+        assert det.rhat_threshold   == 1.1
         assert det.rhat_wmin        == 50
         assert det.rhat_method      == "split"
         assert det.rhat_num_windows == 10
