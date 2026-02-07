@@ -78,7 +78,8 @@ class MetricComputer:
         
 
     def compute_blockwise(self, samples, metric="swd", num_blocks=6, 
-                          mode="adjacent", ref_samples=None, verbose=True):
+                          mode="adjacent", ref_samples=None, verbose=True,
+                          seed=1):
         """
         Parameters
         ----------
@@ -99,6 +100,7 @@ class MetricComputer:
         results = {"est_all": [], "mean_all": [], "block_pair": [], 
                    "ci_upper": [], "ci_lower": []}
         
+        rng = np.random.default_rng(seed)
         if samples.ndim == 2:
             blocks = np.array_split(samples, num_blocks)
         else:
@@ -121,7 +123,7 @@ class MetricComputer:
         for pair in iterator:
             a = rescaled[pair[0] - 1]
             b = ref if pair[1] == "S" else rescaled[pair[1] - 1]
-            stats = self.bootstrap(metric, a, b)
+            stats = self.bootstrap(metric, a, b, seed=int(rng.integers(0, 2**31 - 1)))
             results["est_all"].append(stats["est"])
             results["mean_all"].append(stats["mean"])
             results["block_pair"].append(pair)
