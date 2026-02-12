@@ -30,10 +30,16 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           pip install setuptools>=65.0
           pip install .[dev]
-          pip install -e .
-
+    
+      - name: Debug directory structure
+        run: |
+          pwd
+          ls -la
+          ls -la swasd/ || true
+          python -c "import sys; print(sys.path)"
+            
       - name: Run tests with coverage
         run: |
-          coverage run -m pytest
+          coverage run -m pytest swasd/tests/ -v
           coverage report -m
           coverage xml
