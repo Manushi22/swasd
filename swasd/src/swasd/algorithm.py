@@ -41,8 +41,188 @@ def _linear_checkpoints(n_iters, start, step, stop = None):
     if ks[-1] != stop:
         ks.append(stop)
     return np.array(sorted(set(ks)), dtype=int)
+    
+def _slice_samples(samples, k):
+    """Return samples truncated to first k iterations."""
+    if samples.ndim == 3:
+        return samples[:, :k, :]
+    return samples[:k, :]
 
-class swasd:
+def _print_summary(history, k_conv, reason, rhat_threshold=None, swd_threshold=None):
+    print("\n" + "=" * 60)
+    print("CONVERGENCE DETECTED!")
+    print("=" * 60)
+    print(f"Convergence at iteration: {k_conv}")
+    print(f"Detection method: {reason.upper()}")
+
+    if reason == "rhat":
+        rhat = history["rhat_best"][-1] if history["rhat_best"] else None
+        if rhat is not None and rhat_threshold is not None:
+            print(f"Final Rhat: {rhat:.4f} (threshold: {rhat_threshold:.4f})")
+
+    if reason == "swd":
+        swd = history["swd_to_stationary"][-1] if history["swd_to_stationary"] else None
+        if swd is not None and swd_threshold is not None:
+            print(f"Final SWD distance: {swd:.4f} (threshold: {swd_threshold:.4f})")
+
+    if history["rhat_best"]:
+        print(f"\nRhat checks performed: {len(history['rhat_best'])}")
+        print(f"Best Rhat achieved: {min(history['rhat_best']):.4f}")
+
+    if history["swd_to_stationary"]:
+        print(f"\nSWD checks performed: {len(history['swd_to_stationary'])}")
+        print(f"Initial SWD: {history['swd_to_stationary'][0]:.4f}")
+        print(f"Final SWD: {history['swd_to_stationary'][-1]:.4f}")
+
+    print("=" * 60)
+
+
+def convergence_check(
+    samples,
+    *,
+    do_rhat_check,
+    do_swd_check,
+    history,
+    metric_comp,
+    n_blocks=6,
+    block_mode="all_pairs",
+    wo_init_block=True,
+    convg_threshold=1.0,
+    true_swd=False,
+    true_samples=None,
+    rhat_threshold=1.01,
+    rhat_wmin=200,
+    rhat_method="rank",
+    rhat_num_windows=5,
+    verbose=2,
+):
+    """
+    Algorithm 1 (function): Given samples and an iteration k, run whichever checks
+    are scheduled at k (Rhat and/or SWD), update history, and return:
+
+      (k_conv, convergence_reason) or (None, None)
+    """
+    k = samples.shape[0] if samples.ndim == 2 else samples.shape[1]
+    # --------------------
+    # Rhat check at k
+    # --------------------
+    if do_rhat_check:
+        w_upper = int(0.95 * k)
+        if w_upper > rhat_wmin:
+            windows = np.linspace(rhat_wmin, w_upper, num=rhat_num_windows, dtype=int)
+            success, best_w, best_rhat = rhat_check(
+                samples,
+                windows=windows,
+                rhat_threshold=rhat_threshold,
+                method=rhat_method,
+            )
+
+            history["rhat_check_iterate"].append(k)
+            history["rhat_best_w"].append(best_w)
+            history["rhat_best"].append(best_rhat)
+
+            if verbose == 3:
+                tqdm.write(f"[Rhat] k={k} | rhat={best_rhat:.3f} (best_w={best_w})")
+
+            if success:
+                history["k_conv"] = k
+                history["convergence_reason"] = "rhat"
+                return k, "rhat"
+
+    # --------------------
+    # SWD check at k
+    # --------------------
+    if do_swd_check:
+        swd_results = metric_comp.compute_blockwise(
+            samples,
+            metric="swd",
+            num_blocks=n_blocks,
+            mode=block_mode,
+            verbose=False,
+        )
+        history["pairwise_swd_results"].append(swd_results)
+
+        if true_swd:
+            swd_true_results = metric_comp.compute_blockwise(
+                samples,
+                metric="swd",
+                num_blocks=n_blocks,
+                mode="true",
+                ref_samples=true_samples,
+                verbose=False,
+            )
+            history["true_swd_results"].append(swd_true_results)
+
+        block_pairs = np.array(swd_results["block_pair"], dtype=object)
+        sw_values = np.array(swd_results.get("est_all", swd_results.get("mean_all")), dtype=float)
+
+        if wo_init_block:
+            mask = np.array([not (pair[0] == 1 or pair[1] == 1) for pair in block_pairs], dtype=bool)
+            block_pairs = block_pairs[mask]
+            sw_values = sw_values[mask]
+
+        bp_int = []
+        for p in block_pairs:
+            i, j = p
+            if isinstance(j, str):  # skip "true" pairs etc
+                continue
+            bp_int.append((int(i), int(j)))
+        block_pairs_int = np.array(bp_int, dtype=int)
+
+        model = MonotoneSWDModel()
+        est_result = model.fit_and_estimate(
+            n_blocks,
+            block_pairs_int,
+            sw_values,
+            return_bands=True,
+            cred_interval=(10, 90),
+        )
+        history["estimated_swd_results"].append(est_result)
+
+        # regression diagnostics
+        sw_log = np.log(sw_values)
+        i_idx = block_pairs_int[:, 0]
+        j_idx = block_pairs_int[:, 1]
+        reg_result = model.predicted_vs_residual(sw_log, i_idx, j_idx)
+        history["regression_results"].append(reg_result)
+
+        swd_to_stationary = float(est_result["swd_est_mean"][-1])
+        history["swd_to_stationary"].append(swd_to_stationary)
+        history["convg_check_iterate"].append(k)
+
+        if verbose == 3:
+            tqdm.write(f"[SWD] k={k} | final block distance={swd_to_stationary:.4g}")
+
+        if swd_to_stationary < convg_threshold:
+            history["k_conv"] = k
+            history["convergence_reason"] = "swd"
+            return k, "swd"
+
+    return None, None
+
+
+def swasd(
+    samples,
+    n_iters=None,
+    n_blocks=6,
+    n_projections=250,
+    n_bootstrap=10,
+    convg_threshold=1.0,
+    min_iters_per_block=250,
+    check_rate=1.2,
+    block_mode="all_pairs",
+    wo_init_block=True,
+    diagnostic=True,
+    true_swd=False,
+    true_samples=None,
+    rhat_threshold=1.01,
+    rhat_wmin=100,
+    rhat_method="rank",
+    rhat_num_windows=5,
+    rhat_stop_factor=1.5,
+    rhat_check_iter=100,
+    verbose=2,
+):
     """
     Sliced-Wasserstein Automated Stationarity Detection (SWASD).
 
@@ -50,300 +230,170 @@ class swasd:
     computes pairwise Sliced-Wasserstein distances, fits the *monotone SWD model*
     to estimate the blockwise distances d[1]...d[B], and stops when the last
     block's estimated distance less than `convg_threshold`.
+    
+    Parameters
+    ----------
+    samples : `numpy.ndarray`, shape (draws, num_param) or (chains, draws, num_param)
+        Markov chain or SGD samples.
+    n_iters : int
+        Maximum number of iterations to consider from `samples`.
+    n_blocks : int, optional
+        Number of blocks to partition samples into. Default: 6.
+    n_projections : int, optional
+        Number of projections for sliced Wasserstein distance. Default: 250.
+    n_bootstrap : int, optional
+        Bootstrap replicates for SW estimates. Default: 10.
+    convg_threshold : float, optional
+        Convergence criterion on last block's estimated distance (d[B]). Default: 1.0.
+    min_iters_per_block : int, optional
+        Minimum iterations per block before the first check. Default: 250.
+    check_rate : float, optional
+        Geometric growth factor for subsequent checks. Default: 1.2.
+    block_mode : {"all_pairs","adjacent"}, optional
+        Which block pairs to compare for SWD. Default: "all_pairs".
+    wo_init_block : bool, optional
+        Exclude any pair involving block 1 from regression fit. Default: True.
+    diagnostic : bool, optional
+        Store regression fit and predicted-vs-residual diagnostics. Default: True.
+    true_swd : bool, optional
+        If True, compare each block to provided stationary samples (requires `true_samples`).
+    true_samples : np.ndarray, optional
+        Stationary samples if `true_swd=True`.
+    verbose : bool or int, optional
+        Verbosity level:
+        - False or 0: Silent
+        - True or 1: Summary only (default)
+        - 2: Progress bar
+        - 3: Detailed output (all checks)
     """
 
-    def __init__(self, samples, n_iters=None, n_blocks=6, n_projections=250, n_bootstrap=10,
-                 convg_threshold=1.0, min_iters_per_block=250, check_rate=1.2,
-                 block_mode="all_pairs", wo_init_block=True, diagnostic=True,
-                 true_swd=False, true_samples=None, rhat_threshold=1.01,
-                 rhat_wmin=100, rhat_method="rank", rhat_num_windows=5,
-                 rhat_stop_factor=1.5, rhat_check_iter=100, verbose=True):
-        """
-        Parameters
-        ----------
-        samples : `numpy.ndarray`, shape (draws, num_param) or (chains, draws, num_param)
-            Markov chain or SGD samples.
-        n_iters : int
-            Maximum number of iterations to consider from `samples`.
-        n_blocks : int, optional
-            Number of blocks to partition samples into. Default: 6.
-        n_projections : int, optional
-            Number of projections for sliced Wasserstein distance. Default: 250.
-        n_bootstrap : int, optional
-            Bootstrap replicates for SW estimates. Default: 10.
-        convg_threshold : float, optional
-            Convergence criterion on last block's estimated distance (d[B]). Default: 1.0.
-        min_iters_per_block : int, optional
-            Minimum iterations per block before the first check. Default: 250.
-        check_rate : float, optional
-            Geometric growth factor for subsequent checks. Default: 1.2.
-        block_mode : {"all_pairs","adjacent"}, optional
-            Which block pairs to compare for SWD. Default: "all_pairs".
-        wo_init_block : bool, optional
-            Exclude any pair involving block 1 from regression fit. Default: True.
-        diagnostic : bool, optional
-            Store regression fit and predicted-vs-residual diagnostics. Default: True.
-        true_swd : bool, optional
-            If True, compare each block to provided stationary samples (requires `true_samples`).
-        true_samples : np.ndarray, optional
-            Stationary samples if `true_swd=True`.
-        verbose : bool or int, optional
-            Verbosity level:
-            - False or 0: Silent
-            - True or 1: Summary only (default)
-            - 2: Progress bar
-            - 3: Detailed output (all checks)
-        """
-        self.samples = samples
-        self.n_iters = n_iters
-        self.n_blocks = n_blocks
-        self.n_projections = n_projections
-        self.n_bootstrap = n_bootstrap
-        self.convg_threshold = convg_threshold
-        self.min_iters_per_block = min_iters_per_block
-        self.check_rate = check_rate
-        self.block_mode = block_mode
-        self.wo_init_block = wo_init_block
-        self.diagnostic = diagnostic
-        self.true_swd = true_swd
-        self.true_samples = true_samples
-        self.rhat_threshold = rhat_threshold
-        self.rhat_wmin = rhat_wmin
-        self.rhat_method = rhat_method
-        self.rhat_num_windows = rhat_num_windows
-        self.rhat_stop_factor = rhat_stop_factor
-        self.rhat_check_iter = rhat_check_iter
-        if isinstance(verbose, bool):
-            self.verbose = 1 if verbose else 0
-        else:
-            self.verbose = int(verbose)
-        self.history = defaultdict(list)
+    if isinstance(verbose, bool):
+        verbose = 1 if verbose else 0
+    else:
+        verbose = int(verbose)
 
-    def run(self):
-        """Run the iterative SWASD convergence detection using the monotone model."""
-        # validations
-        if self.n_blocks < 2:
-            raise ValueError("n_blocks must be >= 2.")
-        if self.min_iters_per_block < 1:
-            raise ValueError("min_iters_per_block must be >= 1.")
-        if self.check_rate <= 1.0:
-            raise ValueError("check_rate should be > 1.0 to space checks out.")
-        if self.block_mode not in {"all_pairs", "adjacent"}:
-            raise ValueError("block_mode must be 'all_pairs' or 'adjacent'.")
-        if self.true_swd and self.true_samples is None:
-            raise ValueError("true_swd=True requires `true_samples`.")
+    # ---- validations ----
+    if n_blocks < 2:
+        raise ValueError("n_blocks must be >= 2.")
+    if min_iters_per_block < 1:
+        raise ValueError("min_iters_per_block must be >= 1.")
+    if check_rate <= 1.0:
+        raise ValueError("check_rate should be > 1.0.")
+    if block_mode not in {"all_pairs", "adjacent"}:
+        raise ValueError("block_mode must be 'all_pairs' or 'adjacent'.")
+    if true_swd and true_samples is None:
+        raise ValueError("true_swd=True requires `true_samples`.")
 
-        if self.n_iters is None:
-            self.n_iters = self.samples.shape[0] if self.samples.ndim == 2 else self.samples.shape[1]
-        elif (self.samples.ndim == 2 and self.n_iters > self.samples.shape[0]) or \
-             (self.samples.ndim == 3 and self.n_iters > self.samples.shape[1]):
+    if n_iters is None:
+        n_iters = samples.shape[0] if samples.ndim == 2 else samples.shape[1]
+    else:
+        max_avail = samples.shape[0] if samples.ndim == 2 else samples.shape[1]
+        if n_iters > max_avail:
             raise ValueError("n_iters exceeds available iterations in `samples`.")
+
+    history = defaultdict(list)
+
+    k0 = min_iters_per_block * n_blocks
+    if k0 > n_iters:
+        if verbose >= 1:
+            print(f"Not enough iterations for first check: need {k0}, have {n_iters}.")
+        history["k_conv"] = None
+        return dict(history)
+
+    # ---- checkpoints ----
+    swasd_checks = _geometric_checkpoints(n_iters, k0, check_rate)
+
+    rhat_stop = min(n_iters, int(np.ceil(rhat_stop_factor * k0)))
+    rhat_checks = _linear_checkpoints(
+        n_iters=n_iters,
+        start=rhat_wmin,
+        step=rhat_check_iter,
+        stop=rhat_stop,
+    )
+
+    rhat_check_set = set(rhat_checks.tolist())
+    swasd_check_set = set(swasd_checks.tolist())
+    checkpoints = np.unique(np.concatenate([rhat_checks, swasd_checks])).astype(int)
+
+    metric_comp = MetricComputer(n_projections, n_bootstrap)
+
+    best_rhat_overall = None
+    best_rhat_k = None
+
+    pbar = None
+    pbar_state = {}
+    if verbose >= 2:
+        pbar = tqdm(total=len(checkpoints), desc="SWASD Convergence Detection", unit="check", leave=True)
+
+    for k in checkpoints:
+        do_rhat = (k in rhat_check_set) and (k <= rhat_stop)
+        do_swd = (k in swasd_check_set) and (k >= k0)
+
+        if verbose >= 2 and pbar is not None:
+            pbar_state["k"] = k
+            if history["rhat_best"]:
+                pbar_state["rhat"] = f"{history['rhat_best'][-1]:.3f}"
+            if history["swd_to_stationary"]:
+                pbar_state["SWD"] = f"{history['swd_to_stationary'][-1]:.3f}"
+            pbar.set_postfix(pbar_state)
+            pbar.update(1)
             
-        k0 = self.min_iters_per_block * self.n_blocks
-        if k0 > self.n_iters:
-            if self.verbose >= 1:
-                print(f"Not enough iterations for first check: need {k0}, have {self.n_iters}.")
-            self.history["k_conv"] = None
-            return dict(self.history)
+        xk = _slice_samples(samples, k)
+        
+        k_conv, reason = convergence_check(
+            xk,
+            do_rhat_check=do_rhat,
+            do_swd_check=do_swd,
+            history=history,
+            metric_comp=metric_comp,
+            n_blocks=n_blocks,
+            block_mode=block_mode,
+            wo_init_block=wo_init_block,
+            convg_threshold=convg_threshold,
+            true_swd=true_swd,
+            true_samples=true_samples,
+            rhat_threshold=rhat_threshold,
+            rhat_wmin=rhat_wmin,
+            rhat_method=rhat_method,
+            rhat_num_windows=rhat_num_windows,
+            verbose=verbose,
+        )
 
-        swasd_checks = _geometric_checkpoints(self.n_iters, k0, self.check_rate)
-        rhat_stop = min(self.n_iters, int(np.ceil(self.rhat_stop_factor * k0)))
-        rhat_checks = _linear_checkpoints(n_iters=self.n_iters,
-                                            start=self.rhat_wmin,
-                                            step=self.rhat_check_iter,
-                                            stop=rhat_stop,
-                                            )
-        rhat_check_set = set(rhat_checks.tolist())
-        checkpoints = np.unique(np.concatenate([rhat_checks, swasd_checks])).astype(int)
-        
-        k_conv = None
+        # track best rhat (for final reporting)
+        if history["rhat_best"]:
+            cur = history["rhat_best"][-1]
+            if (best_rhat_overall is None) or (cur < best_rhat_overall):
+                best_rhat_overall = cur
+                best_rhat_k = k
 
-        metric_comp = MetricComputer(self.n_projections, self.n_bootstrap)
-        
-        if self.verbose >= 2:
-            pbar = tqdm(total=len(checkpoints), desc="SWASD Convergence Detection", 
-                       unit="check", leave=True)
-            pbar_state = {}
-        
-        best_rhat_overall = None
-        best_rhat_k = None
-        
-        for checkpoint_idx, k in enumerate(checkpoints):
-            if (k in rhat_check_set) and (k <= rhat_stop):
-                xk = self.samples[:, :k, :] if self.samples.ndim == 3 else self.samples[:k, :]
-                w_upper = int(0.95 * k)
-        
-                if w_upper > self.rhat_wmin:
-                    windows = np.linspace(self.rhat_wmin, w_upper, num=self.rhat_num_windows, dtype=int)
-                    success, best_w, best_rhat = rhat_check(
-                        xk,
-                        windows=windows,
-                        rhat_threshold=self.rhat_threshold,
-                        method=self.rhat_method,
-                    )
-        
-                    self.history["rhat_check_iterate"].append(k)
-                    self.history["rhat_best_w"].append(best_w)
-                    self.history["rhat_best"].append(best_rhat)
-        
-                    if best_rhat_overall is None or best_rhat < best_rhat_overall:
-                        best_rhat_overall = best_rhat
-                        best_rhat_k = k
-        
-                    if self.verbose == 3:
-                        tqdm.write(f"[Rhat] k={k} | rhat={best_rhat:.3f} (best_w={best_w})")
-                    elif self.verbose == 2:
-                        pbar_state['rhat'] = f'{best_rhat:.3f}'
-                        pbar_state['k'] = k
-                        pbar.set_postfix(pbar_state)
-                        
-                    if success:
-                        k_conv = k
-                        self.history["k_conv"] = k_conv
-                        self.history["convergence_reason"] = "rhat"
-                    
-                        if self.verbose >= 2:
-                            pbar.close()
-                        if self.verbose >= 1:
-                            self._print_summary(k_conv, "rhat", best_rhat=best_rhat)
-                            
-                        return dict(self.history)
-                    
-            if self.verbose >= 2:
-                pbar_state['k'] = k
-                pbar.set_postfix(pbar_state)
-                pbar.update(1)
-                
-            if k < k0:
-                continue
-
-            if self.samples.ndim == 3:
-                new_samples = self.samples[:, :k, :]
-            else:
-                new_samples = self.samples[:k, :]
-
-            swd_results = metric_comp.compute_blockwise(
-                new_samples,
-                metric="swd",
-                num_blocks=self.n_blocks,
-                mode=self.block_mode,
-                verbose=False,
-            )
-            self.history["pairwise_swd_results"].append(swd_results)
-            
-            if self.true_swd:
-                swd_true_results = metric_comp.compute_blockwise(
-                    new_samples,
-                    metric="swd",
-                    num_blocks=self.n_blocks,
-                    mode="true",
-                    ref_samples=self.true_samples if self.true_swd else None,
-                    verbose=False,
+        if k_conv is not None:
+            if verbose >= 2 and pbar is not None:
+                pbar.close()
+            if verbose >= 1:
+                _print_summary(
+                    history,
+                    k_conv,
+                    reason,
+                    rhat_threshold=rhat_threshold,
+                    swd_threshold=convg_threshold,
                 )
-                self.history["true_swd_results"].append(swd_true_results)
+            return dict(history)
 
-            block_pairs = np.array(swd_results["block_pair"], dtype=object)
-            sw_values = np.array(swd_results.get("est_all", swd_results.get("mean_all")), dtype=float)
+    if verbose >= 2 and pbar is not None:
+        pbar.close()
 
-            if self.wo_init_block:
-                # Filter out any pair involving block 1
-                mask = np.array([not (pair[0] == 1 or pair[1] == 1) for pair in block_pairs], dtype=bool)
-                block_pairs = block_pairs[mask]
-                sw_values = sw_values[mask]
+    history["k_conv"] = None
 
-            bp_int = []
-            for p in block_pairs:
-                i, j = p
-                if isinstance(j, str):
-                    continue
-                bp_int.append((int(i), int(j)))
-            block_pairs_int = np.array(bp_int, dtype=int)
+    if verbose >= 1:
+        print("\n" + "=" * 60)
+        print("CONVERGENCE NOT DETECTED")
+        print("=" * 60)
+        if history["swd_to_stationary"]:
+            print(f"Final SWD distance: {history['swd_to_stationary'][-1]:.4f}")
+            print(f"Threshold: {convg_threshold:.4f}")
+        if best_rhat_overall is not None:
+            print(f"Best Rhat: {best_rhat_overall:.4f} at k={best_rhat_k}")
+        print(f"Total checkpoints evaluated: {len(checkpoints)}")
+        print("=" * 60)
 
-            model = MonotoneSWDModel()
-            est_result = model.fit_and_estimate(
-                self.n_blocks,
-                block_pairs_int,
-                sw_values,
-                return_bands=True,
-                cred_interval=(10, 90),
-            )
-            self.history["estimated_swd_results"].append(est_result)
-
-            # Regression diagnostics on log scale
-            sw_log = np.log(sw_values)
-            i_idx = block_pairs_int[:, 0]
-            j_idx = block_pairs_int[:, 1]
-            reg_result = model.predicted_vs_residual(
-                sw_log, i_idx, j_idx
-            )
-            self.history["regression_results"].append(reg_result)
-
-            swd_to_stationary = float(est_result["swd_est_mean"][-1])
-            self.history["swd_to_stationary"].append(swd_to_stationary)
-            self.history["convg_check_iterate"].append(k)
-            
-            if self.verbose == 3:
-                msg = f" k = {k} iterations| final block distance: {swd_to_stationary:.4g}"
-                tqdm.write(msg)
-            elif self.verbose == 2:
-                pbar_state['SWD'] = f'{swd_to_stationary:.3f}'
-                pbar_state['k'] = k
-                pbar.set_postfix(pbar_state)
-            
-            if swd_to_stationary < self.convg_threshold:
-                k_conv = k
-                self.history["convergence_reason"] = "swd"
-                if self.verbose >= 2:
-                    pbar.close()
-                if self.verbose >= 1:
-                    self._print_summary(k_conv, "swd", swd=swd_to_stationary)
-                    
-                break
-        
-        if self.verbose >= 2:
-            pbar.close()
-        
-        self.history["k_conv"] = k_conv
-        
-        if k_conv is None and self.verbose >= 1:
-            print("\n" + "="*60)
-            print("CONVERGENCE NOT DETECTED")
-            print("="*60)
-            if self.history["swd_to_stationary"]:
-                print(f"Final SWD distance: {self.history['swd_to_stationary'][-1]:.4f}")
-                print(f"Threshold: {self.convg_threshold:.4f}")
-            if best_rhat_overall is not None:
-                print(f"Best Rhat: {best_rhat_overall:.4f} at k={best_rhat_k}")
-            print(f"Total checkpoints evaluated: {len(checkpoints)}")
-            print("="*60)
-            
-        return dict(self.history)
-    
-    def _print_summary(self, k_conv, reason, **kwargs):
-        """Print a clean convergence summary."""
-        print("\n" + "="*60)
-        print("CONVERGENCE DETECTED!")
-        print("="*60)
-        print(f"Convergence at iteration: {k_conv}")
-        print(f"Detection method: {reason.upper()}")
-        
-        if reason == "rhat":
-            rhat = kwargs.get('best_rhat')
-            if rhat is not None:
-                print(f"Final Rhat: {rhat:.4f} (threshold: {self.rhat_threshold:.4f})")
-        elif reason == "swd":
-            swd = kwargs.get('swd')
-            if swd is not None:
-                print(f"Final SWD distance: {swd:.4f} (threshold: {self.convg_threshold:.4f})")
-        
-        # Summary statistics
-        if self.history["rhat_best"]:
-            print(f"\nRhat checks performed: {len(self.history['rhat_best'])}")
-            print(f"Best Rhat achieved: {min(self.history['rhat_best']):.4f}")
-        
-        if self.history["swd_to_stationary"]:
-            print(f"\nSWD checks performed: {len(self.history['swd_to_stationary'])}")
-            print(f"Initial SWD: {self.history['swd_to_stationary'][0]:.4f}")
-            print(f"Final SWD: {self.history['swd_to_stationary'][-1]:.4f}")
-        
-        print("="*60)
+    return dict(history)

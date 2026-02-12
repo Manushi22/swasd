@@ -1,549 +1,678 @@
 import numpy as np
 import pytest
-from unittest.mock import patch, call
+from unittest.mock import Mock, MagicMock, patch, call
 from collections import defaultdict
+from io import StringIO
+import sys
 
-from swasd.algorithm import swasd, _geometric_checkpoints, _linear_checkpoints
-
-# ---------------------------------------------------------------------------
-# patch target strings  (must match the module where the names are LOOKED UP)
-# ---------------------------------------------------------------------------
-P_RHAT      = "swasd.algorithm.rhat_check"
-P_BLOCKWISE = "swasd.algorithm.MetricComputer.compute_blockwise"
-P_FIT_EST   = "swasd.algorithm.MonotoneSWDModel.fit_and_estimate"
-P_PVSR      = "swasd.algorithm.MonotoneSWDModel.predicted_vs_residual"
-
-
-# ---------------------------------------------------------------------------
-# deterministic mock return-values  (shared across many tests)
-# ---------------------------------------------------------------------------
-
-def _blockwise_result(samples, metric="swd", num_blocks=6, mode="all_pairs", **kw):
-    """Mimic MetricComputer.compute_blockwise output."""
-    import itertools
-
-    # your test uses 1..B indexing (keep that consistent with the rest of your tests)
-    if mode == "adjacent":
-        pairs = [(i, i + 1) for i in range(1, num_blocks)]
-    else:
-        pairs = list(itertools.combinations(range(1, num_blocks + 1), 2))
-
-    est = [abs(a - b) * 0.4 + 0.05 for a, b in pairs]
-    return {"block_pair": pairs, "est_all": est, "mean_all": est}
+# Import the functions to test
+from swasd.algorithm import (
+    swasd,
+    convergence_check,
+    _slice_samples,
+    _print_summary,
+    _geometric_checkpoints,
+    _linear_checkpoints,
+)
 
 
-def _fit_and_estimate(num_blocks, block_pairs, sw_values, **kw):
-    """Monotone curve ending at 0.3 (below most test thresholds)."""
-    mean = np.linspace(2.0, 0.3, num_blocks)
-    return dict(swd_est_mean=mean, swd_est_median=mean,
-                swd_lci=mean * 0.8, swd_uci=mean * 1.2, idata=None)
+# ==============================================================================
+# Test Helper Functions
+# ==============================================================================
 
+class TestSliceSamples:
+    """Test _slice_samples helper function."""
+    
+    def test_slice_2d_samples(self):
+        """Test slicing 2D samples (T, d)."""
+        samples = np.random.randn(1000, 5)
+        result = _slice_samples(samples, 500)
+        assert result.shape == (500, 5)
+        np.testing.assert_array_equal(result, samples[:500, :])
+    
+    def test_slice_3d_samples(self):
+        """Test slicing 3D samples (C, T, d)."""
+        samples = np.random.randn(4, 1000, 5)
+        result = _slice_samples(samples, 500)
+        assert result.shape == (4, 500, 5)
+        np.testing.assert_array_equal(result, samples[:, :500, :])
+    
+    def test_slice_at_boundary(self):
+        """Test slicing at exact sample size."""
+        samples = np.random.randn(100, 3)
+        result = _slice_samples(samples, 100)
+        assert result.shape == (100, 3)
+        np.testing.assert_array_equal(result, samples)
+    
+    def test_slice_first_iteration(self):
+        """Test slicing to get just first iteration."""
+        samples = np.random.randn(1000, 5)
+        result = _slice_samples(samples, 1)
+        assert result.shape == (1, 5)
 
-def _predicted_vs_residual(y_log, i, j, compute_fit_diagnostic=True):
-    out = dict(y_predicted=y_log, residuals=np.zeros_like(y_log),
-               lower_CI=y_log - 0.1, upper_CI=y_log + 0.1)
-    if compute_fit_diagnostic:
-        out["fit_diagnostic"] = 0.05
-    return out
-
-
-# ---------------------------------------------------------------------------
-# 1.  _geometric_checkpoints  (pure, unchanged – kept for completeness)
-# ---------------------------------------------------------------------------
 
 class TestGeometricCheckpoints:
-
+    """Test _geometric_checkpoints helper."""
+    
     def test_basic_sequence(self):
-        cps = _geometric_checkpoints(1000, 100, 1.5)
-        assert cps[0] == 100
-        assert cps[-1] == 1000
-        assert all(cps[i] < cps[i + 1] for i in range(len(cps) - 1))
-
-    def test_small_n_iters(self):
-        cps = _geometric_checkpoints(100, 10, 2.0)
-        assert cps[0] == 10
-        assert cps[-1] == 100
-
-    def test_rate_le_1_raises(self):
+        """Test basic geometric checkpoint generation."""
+        ckpts = _geometric_checkpoints(1000, 100, 1.5)
+        assert ckpts[0] == 100
+        assert ckpts[-1] == 1000
+        assert len(ckpts) > 1
+        assert np.all(np.diff(ckpts) > 0)  # Increasing
+    
+    def test_rate_validation(self):
+        """Test that rate <= 1.0 raises ValueError."""
         with pytest.raises(ValueError, match="check_rate must be > 1.0"):
             _geometric_checkpoints(1000, 100, 1.0)
+        
         with pytest.raises(ValueError, match="check_rate must be > 1.0"):
             _geometric_checkpoints(1000, 100, 0.5)
-
+    
+    def test_ends_at_n_iters(self):
+        """Test that sequence always ends at n_iters."""
+        ckpts = _geometric_checkpoints(999, 100, 1.2)
+        assert ckpts[-1] == 999
+    
     def test_no_duplicates(self):
-        cps = _geometric_checkpoints(1000, 100, 1.1)
-        assert len(cps) == len(set(cps.tolist()))
+        """Test no duplicate checkpoints."""
+        ckpts = _geometric_checkpoints(1000, 100, 1.1)
+        assert len(ckpts) == len(np.unique(ckpts))
+    
+    def test_small_n_iters(self):
+        """Test with small iteration count."""
+        ckpts = _geometric_checkpoints(50, 10, 1.5)
+        assert ckpts[0] == 10
+        assert ckpts[-1] == 50
 
-    def test_always_ends_at_n_iters(self):
-        for n in (100, 500, 1000, 5000):
-            assert _geometric_checkpoints(n, 50, 1.5)[-1] == n
-
-
-# ---------------------------------------------------------------------------
-# 2.  _linear_checkpoints  (NEW in v2)
-# ---------------------------------------------------------------------------
 
 class TestLinearCheckpoints:
-
+    """Test _linear_checkpoints helper."""
+    
     def test_basic_range(self):
-        cps = _linear_checkpoints(n_iters=1000, start=100, step=50)
-        assert cps[0] == 100
-        assert cps[-1] == 1000          # stop defaults to n_iters
-        # strictly increasing, gaps ≤ step
-        diffs = np.diff(cps)
-        assert all(d > 0 for d in diffs)
-        assert all(d <= 50 for d in diffs)
-
-    def test_explicit_stop(self):
-        cps = _linear_checkpoints(1000, 100, 50, stop=300)
-        assert cps[0] == 100
-        assert cps[-1] == 300
-
-    def test_stop_clamped_to_n_iters(self):
-        """stop > n_iters must be clamped."""
-        cps = _linear_checkpoints(200, 50, 30, stop=9999)
-        assert cps[-1] == 200
-
-    def test_step_lt_1_raises(self):
+        """Test basic linear checkpoint generation."""
+        ckpts = _linear_checkpoints(1000, 100, 50)
+        assert ckpts[0] == 100
+        assert ckpts[-1] == 1000
+        assert np.all(np.diff(ckpts) <= 50)
+    
+    def test_with_explicit_stop(self):
+        """Test with explicit stop value."""
+        ckpts = _linear_checkpoints(1000, 100, 50, stop=500)
+        assert ckpts[0] == 100
+        assert ckpts[-1] == 500
+        assert np.max(ckpts) <= 500
+    
+    def test_stop_clamping(self):
+        """Test that stop is clamped to n_iters."""
+        ckpts = _linear_checkpoints(1000, 100, 50, stop=2000)
+        assert ckpts[-1] == 1000  # Clamped to n_iters
+    
+    def test_step_validation(self):
+        """Test that step < 1 raises ValueError."""
         with pytest.raises(ValueError, match="step must be >= 1"):
-            _linear_checkpoints(1000, 100, step=0)
-
-    def test_start_gt_stop_returns_empty(self):
-        cps = _linear_checkpoints(1000, 500, 10, stop=200)
-        assert len(cps) == 0
-        assert cps.dtype == int
-
+            _linear_checkpoints(1000, 100, 0)
+    
+    def test_start_greater_than_stop(self):
+        """Test empty array when start > stop."""
+        ckpts = _linear_checkpoints(1000, 500, 50, stop=300)
+        assert len(ckpts) == 0
+    
     def test_no_duplicates(self):
-        cps = _linear_checkpoints(1000, 100, 100, stop=600)
-        assert len(cps) == len(set(cps.tolist()))
-
+        """Test no duplicate checkpoints."""
+        ckpts = _linear_checkpoints(1000, 100, 10)
+        assert len(ckpts) == len(np.unique(ckpts))
+    
     def test_start_equals_stop(self):
-        """Exactly one checkpoint when start == stop."""
-        cps = _linear_checkpoints(500, 200, 50, stop=200)
-        assert list(cps) == [200]
-
-    def test_step_larger_than_range(self):
-        """step > (stop - start) → [start, stop] only."""
-        cps = _linear_checkpoints(1000, 100, 9999, stop=400)
-        assert list(cps) == [100, 400]
-
+        """Test edge case where start equals stop."""
+        ckpts = _linear_checkpoints(1000, 500, 50, stop=500)
+        assert len(ckpts) == 1
+        assert ckpts[0] == 500
+    
+    def test_large_step(self):
+        """Test step larger than range."""
+        ckpts = _linear_checkpoints(1000, 100, 2000, stop=500)
+        assert ckpts[0] == 100
+        assert ckpts[-1] == 500
+    
     def test_returns_int_dtype(self):
-        cps = _linear_checkpoints(500, 50, 25)
-        assert cps.dtype == int
+        """Test that output is integer array."""
+        ckpts = _linear_checkpoints(1000, 100, 50)
+        assert ckpts.dtype in [np.int32, np.int64, np.int_]
 
 
-# ---------------------------------------------------------------------------
-# 3.  __init__ – new rhat parameters are stored correctly
-# ---------------------------------------------------------------------------
+class TestPrintSummary:
+    """Test _print_summary helper."""
+    
+    def test_rhat_convergence_summary(self, capsys):
+        """Test summary for Rhat convergence."""
+        history = {
+            "rhat_best": [3.1, 3.0, 2.9, 1.05],
+            "swd_to_stationary": [],
+        }
+        _print_summary(history, k_conv=1000, reason="rhat", 
+                      rhat_threshold=1.1, swd_threshold=1.0)
+        
+        captured = capsys.readouterr()
+        assert "CONVERGENCE DETECTED" in captured.out
+        assert "iteration: 1000" in captured.out
+        assert "RHAT" in captured.out
+        assert "1.05" in captured.out
+    
+    def test_swd_convergence_summary(self, capsys):
+        """Test summary for SWD convergence."""
+        history = {
+            "rhat_best": [],
+            "swd_to_stationary": [5.0, 3.0, 1.5, 0.8],
+        }
+        _print_summary(history, k_conv=1500, reason="swd",
+                      rhat_threshold=1.1, swd_threshold=1.0)
+        
+        captured = capsys.readouterr()
+        assert "CONVERGENCE DETECTED" in captured.out
+        assert "iteration: 1500" in captured.out
+        assert "SWD" in captured.out
+        assert "0.8" in captured.out
+    
+    def test_combined_metrics_summary(self, capsys):
+        """Test summary when both Rhat and SWD checked."""
+        history = {
+            "rhat_best": [3.0, 2.5, 2.0],
+            "swd_to_stationary": [5.0, 3.0, 1.5, 0.9],
+        }
+        _print_summary(history, k_conv=2000, reason="swd",
+                      rhat_threshold=1.1, swd_threshold=1.0)
+        
+        captured = capsys.readouterr()
+        assert "Rhat checks performed: 3" in captured.out
+        assert "SWD checks performed: 4" in captured.out
+        assert "Best Rhat achieved: 2.0" in captured.out
+        assert "Initial SWD: 5.0" in captured.out
 
-class TestInitRhatParams:
 
-    @pytest.fixture
-    def samples(self):
-        np.random.seed(0)
-        return np.random.randn(2000, 3)
+# ==============================================================================
+# Test convergence_check Function
+# ==============================================================================
 
-    def test_defaults(self, samples):
-        det = swasd(samples=samples)
-        assert det.rhat_threshold   == 1.01
-        assert det.rhat_wmin        == 100
-        assert det.rhat_method      == "rank"
-        assert det.rhat_num_windows == 5
-        assert det.rhat_stop_factor == 1.5
-        assert det.rhat_check_iter  == 100
+class TestConvergenceCheck:
+    """Test convergence_check function."""
+    
+    @patch('swasd.algorithm.rhat_check')
+    def test_rhat_success_early_return(self, mock_rhat):
+        """Test that Rhat success triggers early return."""
+        mock_rhat.return_value = (True, 500, 1.02)
+        
+        samples = np.random.randn(4, 1000, 5)
+        xk = _slice_samples(samples, 600)
+        history = defaultdict(list)
+        metric_comp = Mock()
+        
+        k_conv, reason = convergence_check(
+            xk,
+            do_rhat_check=True,
+            do_swd_check=True,
+            history=history,
+            metric_comp=metric_comp,
+            rhat_threshold=1.1,
+            rhat_wmin=100,
+            rhat_method="rank",
+            rhat_num_windows=5,
+            verbose=0,
+        )
+        
+        assert k_conv == 600
+        assert reason == "rhat"
+        assert history["rhat_best"][-1] == 1.02
+        # SWD should NOT have been computed
+        metric_comp.compute_blockwise.assert_not_called()
+    
+    @patch('swasd.algorithm.rhat_check')
+    @patch('swasd.algorithm.MonotoneSWDModel')
+    def test_rhat_fail_then_swd_success(self, mock_model_class, mock_rhat):
+        """Test SWD check when Rhat fails."""
+        mock_rhat.return_value = (False, 500, 2.5)
+        
+        # Mock SWD computation
+        mock_metric = Mock()
+        mock_metric.compute_blockwise.return_value = {
+            "block_pair": [(2, 3), (3, 4), (4, 5)],
+            "est_all": [2.0, 1.5, 1.0],
+        }
+        
+        # Mock regression model
+        mock_model = Mock()
+        mock_model.fit_and_estimate.return_value = {
+            "swd_est_mean": np.array([3.0, 2.0, 1.5, 1.0, 0.5, 0.3]),
+        }
+        mock_model.predicted_vs_residual.return_value = {
+            "y_predicted": np.array([1.0, 1.0, 1.0]),
+            "residuals": np.array([0.1, -0.1, 0.0]),
+        }
+        mock_model_class.return_value = mock_model
+        
+        samples = np.random.randn(2000, 5)
+        xk = _slice_samples(samples, 1500)
+        history = defaultdict(list)
+        
+        k_conv, reason = convergence_check(
+            xk,
+            do_rhat_check=True,
+            do_swd_check=True,
+            history=history,
+            metric_comp=mock_metric,
+            n_blocks=6,
+            convg_threshold=0.5,
+            rhat_threshold=1.1,
+            rhat_wmin=100,
+            rhat_method="rank",
+            rhat_num_windows=5,
+            verbose=0,
+        )
+        
+        # Rhat was checked
+        assert len(history["rhat_best"]) == 1
+        assert history["rhat_best"][0] == 2.5
+        
+        # SWD converged
+        assert k_conv == 1500
+        assert reason == "swd"
+        assert history["swd_to_stationary"][-1] == 0.3
+    
+    @patch('swasd.algorithm.MonotoneSWDModel')
+    def test_swd_only_no_convergence(self, mock_model_class):
+        """Test SWD check without convergence."""
+        mock_metric = Mock()
+        mock_metric.compute_blockwise.return_value = {
+            "block_pair": [(2, 3), (3, 4)],
+            "est_all": [2.0, 1.5],
+        }
+        
+        mock_model = Mock()
+        mock_model.fit_and_estimate.return_value = {
+            "swd_est_mean": np.array([5.0, 4.0, 3.0, 2.5, 2.0, 1.8]),
+        }
+        mock_model.predicted_vs_residual.return_value = {
+            "y_predicted": np.array([1.0, 1.0]),
+            "residuals": np.array([0.1, -0.1]),
+        }
+        mock_model_class.return_value = mock_model
+        
+        samples = np.random.randn(1000, 3)
+        history = defaultdict(list)
+        
+        k_conv, reason = convergence_check(
+            samples,
+            do_rhat_check=False,
+            do_swd_check=True,
+            history=history,
+            metric_comp=mock_metric,
+            n_blocks=6,
+            convg_threshold=1.0,
+            verbose=0,
+        )
+        
+        # No convergence
+        assert k_conv is None
+        assert reason is None
+        # But SWD was computed
+        assert len(history["swd_to_stationary"]) == 1
+        assert history["swd_to_stationary"][0] == 1.8
+    
+    def test_skip_both_checks(self):
+        """Test when neither check is scheduled."""
+        samples = np.random.randn(1000, 3)
+        xk = _slice_samples(samples, 500)
+        history = defaultdict(list)
+        metric_comp = Mock()
+        
+        k_conv, reason = convergence_check(
+            xk,
+            do_rhat_check=False,
+            do_swd_check=False,
+            history=history,
+            metric_comp=metric_comp,
+            verbose=0,
+        )
+        
+        assert k_conv is None
+        assert reason is None
+        assert len(history["rhat_best"]) == 0
+        assert len(history["swd_to_stationary"]) == 0
 
-    def test_custom_values(self, samples):
-        det = swasd(samples, rhat_threshold=1.1, rhat_wmin=50,
-                    rhat_method="split", rhat_num_windows=10,
-                    rhat_stop_factor=2.0, rhat_check_iter=25)
-        assert det.rhat_threshold   == 1.1
-        assert det.rhat_wmin        == 50
-        assert det.rhat_method      == "split"
-        assert det.rhat_num_windows == 10
-        assert det.rhat_stop_factor == 2.0
-        assert det.rhat_check_iter  == 25
 
+# ==============================================================================
+# Test Main swasd Function
+# ==============================================================================
 
-# ---------------------------------------------------------------------------
-# 4.  run() – input-validation  (unchanged logic; kept for regression safety)
-# ---------------------------------------------------------------------------
-
-class TestValidation:
-
-    @pytest.fixture
-    def samples(self):
-        return np.random.randn(2000, 3)
-
-    def test_n_blocks_lt_2(self, samples):
+class TestSWASDValidation:
+    """Test input validation in swasd function."""
+    
+    def test_n_blocks_too_small(self):
+        """Test n_blocks < 2 raises ValueError."""
+        samples = np.random.randn(1000, 3)
         with pytest.raises(ValueError, match="n_blocks must be >= 2"):
-            swasd(samples, n_blocks=1, verbose=False).run()
-
-    def test_min_iters_lt_1(self, samples):
+            swasd(samples, n_blocks=1)
+    
+    def test_min_iters_per_block_invalid(self):
+        """Test min_iters_per_block < 1 raises ValueError."""
+        samples = np.random.randn(1000, 3)
         with pytest.raises(ValueError, match="min_iters_per_block must be >= 1"):
-            swasd(samples, min_iters_per_block=0, verbose=False).run()
-
-    def test_check_rate_le_1(self, samples):
+            swasd(samples, min_iters_per_block=0)
+    
+    def test_check_rate_invalid(self):
+        """Test check_rate <= 1.0 raises ValueError."""
+        samples = np.random.randn(1000, 3)
         with pytest.raises(ValueError, match="check_rate should be > 1.0"):
-            swasd(samples, check_rate=0.9, verbose=False).run()
-
-    def test_bad_block_mode(self, samples):
+            swasd(samples, check_rate=1.0)
+    
+    def test_invalid_block_mode(self):
+        """Test invalid block_mode raises ValueError."""
+        samples = np.random.randn(1000, 3)
         with pytest.raises(ValueError, match="block_mode must be"):
-            swasd(samples, block_mode="bad", verbose=False).run()
-
-    def test_true_swd_no_ref(self, samples):
+            swasd(samples, block_mode="invalid")
+    
+    def test_true_swd_without_samples(self):
+        """Test true_swd=True without true_samples raises ValueError."""
+        samples = np.random.randn(1000, 3)
         with pytest.raises(ValueError, match="true_swd=True requires"):
-            swasd(samples, true_swd=True, true_samples=None, verbose=False).run()
-
-    def test_n_iters_exceeds_2d(self):
-        with pytest.raises(ValueError, match="exceeds available"):
-            swasd(np.random.randn(100, 3), n_iters=200, verbose=False).run()
-
-    def test_n_iters_exceeds_3d(self):
-        with pytest.raises(ValueError, match="exceeds available"):
-            swasd(np.random.randn(2, 100, 3), n_iters=200, verbose=False).run()
-
-    def test_insufficient_samples_returns_none(self):
-        """k0 = min_iters_per_block * n_blocks > n_iters → immediate None."""
-        result = swasd(np.random.randn(50, 3), n_blocks=6,
-                       min_iters_per_block=100, verbose=False).run()
+            swasd(samples, true_swd=True)
+    
+    def test_n_iters_exceeds_available_2d(self):
+        """Test n_iters > available samples raises ValueError."""
+        samples = np.random.randn(1000, 3)
+        with pytest.raises(ValueError, match="n_iters exceeds"):
+            swasd(samples, n_iters=2000)
+    
+    def test_n_iters_exceeds_available_3d(self):
+        """Test n_iters > available samples for 3D."""
+        samples = np.random.randn(4, 1000, 3)
+        with pytest.raises(ValueError, match="n_iters exceeds"):
+            swasd(samples, n_iters=2000)
+    
+    def test_insufficient_iterations(self, capsys):
+        """Test behavior when k0 > n_iters."""
+        samples = np.random.randn(100, 3)
+        result = swasd(samples, n_blocks=6, min_iters_per_block=50, verbose=1)
+        
         assert result["k_conv"] is None
+        captured = capsys.readouterr()
+        assert "Not enough iterations" in captured.out
 
 
-# ---------------------------------------------------------------------------
-# 5.  Checkpoint-merge arithmetic  (new in v2)
-#     Reconstruct the same logic run() uses and verify structural properties.
-# ---------------------------------------------------------------------------
-
-class TestCheckpointMerge:
-
-    @staticmethod
-    def _merge(n_iters, min_ipb, n_blocks, check_rate,
-               rhat_wmin, rhat_check_iter, rhat_stop_factor):
-        k0 = min_ipb * n_blocks
-        swasd_cs = _geometric_checkpoints(n_iters, k0, check_rate)
-        rhat_stop = min(n_iters, int(np.ceil(rhat_stop_factor * k0)))
-        rhat_cs   = _linear_checkpoints(n_iters, rhat_wmin,
-                                        rhat_check_iter, rhat_stop)
-        merged = np.unique(np.concatenate([rhat_cs, swasd_cs])).astype(int)
-        return merged, set(rhat_cs.tolist()), set(swasd_cs.tolist()), rhat_stop
-
-    def test_merged_sorted_unique(self):
-        merged, _, _, _ = self._merge(2000, 50, 6, 1.2, 100, 50, 1.5)
-        assert list(merged) == sorted(set(merged.tolist()))
-
-    def test_both_subsets_present(self):
-        merged, rset, sset, _ = self._merge(2000, 50, 6, 1.2, 100, 50, 1.5)
-        mset = set(merged.tolist())
-        assert rset.issubset(mset)
-        assert sset.issubset(mset)
-
-    def test_rhat_checkpoints_respect_rhat_stop(self):
-        _, rset, _, rhat_stop = self._merge(2000, 50, 6, 1.2, 100, 50, 1.5)
-        assert all(k <= rhat_stop for k in rset)
-
-    def test_empty_rhat_when_wmin_too_large(self):
-        """rhat_wmin > rhat_stop → rhat_checks is empty."""
-        merged, rset, sset, _ = self._merge(2000, 50, 6, 1.2,
-                                            rhat_wmin=99999,
-                                            rhat_check_iter=50,
-                                            rhat_stop_factor=1.5)
-        assert len(rset) == 0
-        # merged still has the geometric checkpoints
-        assert merged.tolist() == sorted(sset)
-
-
-# ---------------------------------------------------------------------------
-# 6.  run() – Rhat early-exit path
-# ---------------------------------------------------------------------------
-
-class TestRhatEarlyExit:
-    """Every test here patches the full SWD stack so it never touches Stan."""
-
-    # --- helpers -----------------------------------------------------------
-    @staticmethod
-    def _samples_2d(n=2000, d=3):
-        np.random.seed(0)
-        return np.random.randn(n, d)
-
-    @staticmethod
-    def _samples_3d(chains=4, n=500, d=3):
-        np.random.seed(7)
-        return np.random.randn(chains, n, d)
-
-    # common kwargs that guarantee rhat checkpoints exist and the w_upper
-    # guard passes for at least some of them
-    _RHAT_KW = dict(
-        n_blocks=6, min_iters_per_block=50,   # k0 = 300
-        rhat_wmin=100, rhat_check_iter=50,
-        rhat_stop_factor=3.0,                  # rhat_stop = 900
-        rhat_threshold=1.01,
-        verbose=False,
-    )
-
-    # --- 6a.  rhat succeeds → early return ---------------------------------
-
-    @patch(P_BLOCKWISE, side_effect=_blockwise_result)
-    @patch(P_FIT_EST,   side_effect=_fit_and_estimate)
-    @patch(P_PVSR,      side_effect=_predicted_vs_residual)
-    @patch(P_RHAT,      return_value=(True, 150, 1.005))
-    def test_convergence_reason_is_rhat(self, mock_rhat, *_mocks):
-        result = swasd(self._samples_2d(), **self._RHAT_KW).run()
+class TestSWASDBasicFunctionality:
+    """Test basic swasd functionality."""
+    
+    @patch('swasd.algorithm.convergence_check')
+    def test_early_convergence(self, mock_check):
+        """Test early convergence detection."""
+        # Mock needs to update history dict just like real function
+        def mock_convergence(*args, **kwargs):
+            history = kwargs['history']
+            history['k_conv'] = 600
+            history['convergence_reason'] = 'rhat'
+            return (600, "rhat")
+        
+        mock_check.side_effect = mock_convergence
+        
+        samples = np.random.randn(1000, 3)
+        result = swasd(samples, n_blocks=4, min_iters_per_block=50, verbose=0)
+        
+        assert result["k_conv"] == 600
         assert result["convergence_reason"] == "rhat"
-        assert result["k_conv"] is not None
-        mock_rhat.assert_called()
-
-    @patch(P_BLOCKWISE, side_effect=_blockwise_result)
-    @patch(P_FIT_EST,   side_effect=_fit_and_estimate)
-    @patch(P_PVSR,      side_effect=_predicted_vs_residual)
-    @patch(P_RHAT,      return_value=(True, 120, 1.002))
-    def test_swd_blockwise_never_called_on_rhat_success(self, _rhat, _pvsr,
-                                                         _fit, mock_bw):
-        swasd(self._samples_2d(), **self._RHAT_KW).run()
-        mock_bw.assert_not_called()
-
-    @patch(P_BLOCKWISE, side_effect=_blockwise_result)
-    @patch(P_FIT_EST,   side_effect=_fit_and_estimate)
-    @patch(P_PVSR,      side_effect=_predicted_vs_residual)
-    @patch(P_RHAT,      return_value=(True, 200, 1.0))
-    def test_rhat_history_keys_present(self, *_mocks):
-        result = swasd(self._samples_2d(), **self._RHAT_KW).run()
-        assert "rhat_check_iterate" in result
-        assert "rhat_best_w"        in result
-        assert "rhat_best"          in result
-        # at least one entry
-        assert len(result["rhat_check_iterate"]) >= 1
-
-    @patch(P_BLOCKWISE, side_effect=_blockwise_result)
-    @patch(P_FIT_EST,   side_effect=_fit_and_estimate)
-    @patch(P_PVSR,      side_effect=_predicted_vs_residual)
-    @patch(P_RHAT,      return_value=(True, 200, 1.0))
-    def test_rhat_early_return_has_no_swd_history(self, *_mocks):
-        """SWD history keys are absent (defaultdict never populated them)."""
-        result = swasd(self._samples_2d(), **self._RHAT_KW).run()
-        # these keys exist only if the SWD branch ran
-        assert "swd_to_stationary"       not in result
-        assert "pairwise_swd_results"    not in result
-        assert "estimated_swd_results"   not in result
-
-    # --- 6b.  rhat_check receives correct arguments ------------------------
-
-    @patch(P_BLOCKWISE, side_effect=_blockwise_result)
-    @patch(P_FIT_EST,   side_effect=_fit_and_estimate)
-    @patch(P_PVSR,      side_effect=_predicted_vs_residual)
-    def test_rhat_called_with_correct_kwargs(self, *_mocks):
-        captured = {}
-        def _capture(xk, **kw):
-            captured.update(kw)
-            captured["xk_shape"] = xk.shape
-            return (True, 150, 1.0)
-
-        with patch(P_RHAT, side_effect=_capture):
-            swasd(self._samples_2d(), **self._RHAT_KW).run()
-
-        assert captured["rhat_threshold"] == 1.01
-        assert captured["method"]         == "rank"
-        assert "windows" in captured
-        # windows is a numpy array of ints
-        assert captured["windows"].dtype == int
-
-    @patch(P_BLOCKWISE, side_effect=_blockwise_result)
-    @patch(P_FIT_EST,   side_effect=_fit_and_estimate)
-    @patch(P_PVSR,      side_effect=_predicted_vs_residual)
-    def test_rhat_receives_3d_slice(self, *_mocks):
-        """With 3D samples the slice passed to rhat_check keeps dim-0 intact."""
-        captured_shapes = []
-        def _capture(xk, **kw):
-            captured_shapes.append(xk.shape)
-            return (True, 150, 1.0)
-
-        with patch(P_RHAT, side_effect=_capture):
-            swasd(self._samples_3d(), **self._RHAT_KW).run()
-
-        # first shape that was captured must have 4 chains and 3 params
-        assert captured_shapes[0][0] == 4   # chains
-        assert captured_shapes[0][2] == 3   # params
-
-    # --- 6c.  w_upper guard prevents the call when k is too small ----------
-
-    @patch(P_BLOCKWISE, side_effect=_blockwise_result)
-    @patch(P_FIT_EST,   side_effect=_fit_and_estimate)
-    @patch(P_PVSR,      side_effect=_predicted_vs_residual)
-    def test_rhat_not_called_when_w_upper_le_wmin(self, *_mocks):
-        """rhat_wmin=900, k0=300, rhat_stop=ceil(1.1*300)=330.
-        All rhat checkpoints ≤ 330 → 0.95*330 = 313 < 900 → guard fails."""
-        with patch(P_RHAT) as mock_rhat:
-            mock_rhat.return_value = (False, 0, 9.9)
-            swasd(self._samples_2d(),
-                  n_blocks=6, min_iters_per_block=50,
-                  rhat_wmin=900, rhat_check_iter=50,
-                  rhat_stop_factor=1.1,
-                  verbose=False).run()
-            mock_rhat.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# 7.  run() – Rhat fails → falls through to SWD branch
-# ---------------------------------------------------------------------------
-
-class TestRhatFailsThenSWD:
-
-    @staticmethod
-    def _samples():
-        np.random.seed(0)
-        return np.random.randn(2000, 3)
-
-    _KW = dict(
-        n_blocks=6, min_iters_per_block=50,
-        rhat_wmin=100, rhat_check_iter=50,
-        rhat_stop_factor=3.0,
-        convg_threshold=100.0,          # very loose → SWD converges
-        verbose=False,
-    )
-
-    @patch(P_BLOCKWISE, side_effect=_blockwise_result)
-    @patch(P_FIT_EST,   side_effect=_fit_and_estimate)
-    @patch(P_PVSR,      side_effect=_predicted_vs_residual)
-    @patch(P_RHAT,      return_value=(False, 150, 1.5))
-    def test_swd_history_populated(self, *_mocks):
-        result = swasd(self._samples(), **self._KW).run()
-        assert len(result["swd_to_stationary"])      >= 1
-        assert len(result["convg_check_iterate"])    >= 1
-        assert len(result["pairwise_swd_results"])   >= 1
-
-    @patch(P_BLOCKWISE, side_effect=_blockwise_result)
-    @patch(P_FIT_EST,   side_effect=_fit_and_estimate)
-    @patch(P_PVSR,      side_effect=_predicted_vs_residual)
-    @patch(P_RHAT,      return_value=(False, 150, 1.5))
-    def test_rhat_history_also_populated(self, *_mocks):
-        """Even though rhat failed, its history entries are still written."""
-        result = swasd(self._samples(), **self._KW).run()
-        assert len(result["rhat_best"]) >= 1
-
-    @patch(P_BLOCKWISE, side_effect=_blockwise_result)
-    @patch(P_FIT_EST,   side_effect=_fit_and_estimate)
-    @patch(P_PVSR,      side_effect=_predicted_vs_residual)
-    @patch(P_RHAT,      return_value=(False, 150, 1.5))
-    def test_convergence_reason_is_swd(self, *_mocks):
-        result = swasd(self._samples(), **self._KW).run()
-        assert result["convergence_reason"] == "swd"
-
-
-# ---------------------------------------------------------------------------
-# 8.  run() – SWD-only path details  (rhat disabled via high wmin)
-# ---------------------------------------------------------------------------
-
-class TestSWDPath:
-    """rhat is effectively disabled; tests focus on the SWD loop."""
-
-    @staticmethod
-    def _samples(n=2000):
-        np.random.seed(0)
-        return np.random.randn(n, 3)
-
-    # rhat_wmin so high that w_upper never exceeds it
-    _KW = dict(n_blocks=6, min_iters_per_block=50,
-               rhat_wmin=99999, rhat_stop_factor=1.5,
-               verbose=False)
-
-    @patch(P_BLOCKWISE, side_effect=_blockwise_result)
-    @patch(P_FIT_EST,   side_effect=_fit_and_estimate)
-    @patch(P_PVSR,      side_effect=_predicted_vs_residual)
-    def test_history_lengths_consistent(self, *_mocks):
-        result = swasd(self._samples(), convg_threshold=100.0, **self._KW).run()
-        n = len(result["swd_to_stationary"])
-        assert n >= 1
-        assert len(result["convg_check_iterate"])   == n
-        assert len(result["pairwise_swd_results"])  == n
-        assert len(result["estimated_swd_results"]) == n
-        assert len(result["regression_results"])    == n
-
-    @patch(P_BLOCKWISE, side_effect=_blockwise_result)
-    @patch(P_FIT_EST,   side_effect=_fit_and_estimate)
-    @patch(P_PVSR,      side_effect=_predicted_vs_residual)
-    def test_no_convergence_when_threshold_too_tight(self, *_mocks):
-        """_fit_and_estimate ends at 0.3; set threshold below that."""
-        result = swasd(self._samples(), convg_threshold=0.01, **self._KW).run()
+    
+    @patch('swasd.algorithm.convergence_check')
+    def test_no_convergence(self, mock_check, capsys):
+        """Test when convergence is never detected."""
+        # Mock needs to update history with SWD data
+        call_count = [0]
+        
+        def mock_convergence(*args, **kwargs):
+            history = kwargs['history']
+            call_count[0] += 1
+            # Simulate SWD checks
+            if kwargs.get('do_swd_check'):
+                history['swd_to_stationary'].append(2.0)
+                xk = args[0]
+                k = xk.shape[0] if xk.ndim == 2 else xk.shape[1]
+                history['convg_check_iterate'].append(k)
+            return (None, None)
+        
+        mock_check.side_effect = mock_convergence
+        
+        samples = np.random.randn(1000, 3)
+        result = swasd(samples, n_blocks=4, min_iters_per_block=50, verbose=1)
+        
         assert result["k_conv"] is None
-        assert "convergence_reason" not in result
-
-    @patch(P_BLOCKWISE, side_effect=_blockwise_result)
-    @patch(P_FIT_EST,   side_effect=_fit_and_estimate)
-    @patch(P_PVSR,      side_effect=_predicted_vs_residual)
-    def test_n_iters_caps_all_checkpoints(self, *_mocks):
-        result = swasd(self._samples(n=2000), n_iters=800,
-                       convg_threshold=100.0, **self._KW).run()
-        for k in result["convg_check_iterate"]:
-            assert k <= 800
-
-    # -- wo_init_block filtering --------------------------------------------
-
-    @patch(P_BLOCKWISE, side_effect=_blockwise_result)
-    @patch(P_PVSR,      side_effect=_predicted_vs_residual)
-    def test_wo_init_block_true_filters_block_1(self, _pvsr, _bw):
-        """Pairs containing block index 1 must be stripped before regression."""
-        captured = {}
-        def _cap(num_blocks, block_pairs, sw_values, **kw):
-            captured["bp"] = block_pairs.copy()
-            return _fit_and_estimate(num_blocks, block_pairs, sw_values, **kw)
-        with patch(P_FIT_EST, side_effect=_cap):
-            swasd(self._samples(), wo_init_block=True,
-                  convg_threshold=100.0, **self._KW).run()
-        assert 1 not in captured["bp"].flatten()
-
-    @patch(P_BLOCKWISE, side_effect=_blockwise_result)
-    @patch(P_PVSR,      side_effect=_predicted_vs_residual)
-    def test_wo_init_block_false_keeps_block_1(self, _pvsr, _bw):
-        captured = {}
-        def _cap(num_blocks, block_pairs, sw_values, **kw):
-            captured["bp"] = block_pairs.copy()
-            return _fit_and_estimate(num_blocks, block_pairs, sw_values, **kw)
-        with patch(P_FIT_EST, side_effect=_cap):
-            swasd(self._samples(), wo_init_block=False,
-                  convg_threshold=100.0, **self._KW).run()
-        assert 1 in captured["bp"].flatten()
-
-    # -- 3D samples ---------------------------------------------------------
-
-    @patch(P_BLOCKWISE, side_effect=_blockwise_result)
-    @patch(P_FIT_EST,   side_effect=_fit_and_estimate)
-    @patch(P_PVSR,      side_effect=_predicted_vs_residual)
-    def test_3d_samples_complete(self, *_mocks):
-        np.random.seed(0)
-        s = np.random.randn(4, 500, 3)
-        result = swasd(s, convg_threshold=100.0, **self._KW).run()
-        assert "k_conv" in result
+        captured = capsys.readouterr()
+        assert "CONVERGENCE NOT DETECTED" in captured.out
+    
+    @patch('swasd.algorithm.convergence_check')
+    def test_verbose_levels(self, mock_check):
+        """Test different verbose levels."""
+        mock_check.return_value = (None, None)
+        samples = np.random.randn(500, 3)
+        
+        # Silent
+        result = swasd(samples, n_blocks=4, min_iters_per_block=50, verbose=0)
+        assert result is not None
+        
+        # Reset mock for next test
+        mock_check.reset_mock()
+        
+        # Summary
+        result = swasd(samples, n_blocks=4, min_iters_per_block=50, verbose=1)
+        assert result is not None
+        
+        # Reset mock for next test
+        mock_check.reset_mock()
+        
+        # Progress bar (harder to test)
+        result = swasd(samples, n_blocks=4, min_iters_per_block=50, verbose=2)
+        assert result is not None
+    
+    def test_verbose_bool_conversion(self):
+        """Test verbose bool to int conversion."""
+        samples = np.random.randn(100, 3)
+        
+        with patch('swasd.algorithm.convergence_check') as mock_check:
+            mock_check.return_value = (None, None)
+            
+            # verbose=True should be treated as 1
+            result = swasd(samples, n_blocks=4, min_iters_per_block=10, verbose=True)
+            assert result is not None
+            
+            # verbose=False should be treated as 0
+            result = swasd(samples, n_blocks=4, min_iters_per_block=10, verbose=False)
+            assert result is not None
 
 
-# ---------------------------------------------------------------------------
-# 9.  verbose smoke  (nothing crashes, stdout behaves)
-# ---------------------------------------------------------------------------
+class TestSWASDCheckpointLogic:
+    """Test checkpoint creation and merging."""
+    
+    @patch('swasd.algorithm.convergence_check')
+    def test_checkpoint_merge(self, mock_check):
+        """Test that rhat and swasd checkpoints are properly merged."""
+        # Track which types of checks were called
+        rhat_checks = []
+        swd_checks = []
+        
+        def mock_convergence(*args, **kwargs):
+            xk = args[0]
+            k = xk.shape[0] if xk.ndim == 2 else xk.shape[1]
+            if kwargs.get('do_rhat_check'):
+                rhat_checks.append(k)
+            if kwargs.get('do_swd_check'):
+                swd_checks.append(k)
+            return (None, None)
+        
+        mock_check.side_effect = mock_convergence
+        
+        samples = np.random.randn(2000, 3)
+        result = swasd(
+            samples, 
+            n_blocks=6, 
+            min_iters_per_block=100,
+            rhat_wmin=100,
+            rhat_check_iter=50,
+            rhat_stop_factor=1.5,
+            check_rate=1.5,
+            verbose=0
+        )
+        
+        # Should have called convergence_check multiple times
+        assert mock_check.call_count > 0
+        
+        # Check that some calls had do_rhat_check=True
+        assert len(rhat_checks) > 0, "No Rhat checks were performed"
+        
+        # Check that some calls had do_swd_check=True
+        assert len(swd_checks) > 0, "No SWD checks were performed"
 
-class TestVerbose:
 
-    @staticmethod
-    def _samples():
-        np.random.seed(0)
-        return np.random.randn(2000, 3)
+class TestSWASDIntegration:
+    """Integration tests with minimal mocking."""
+    
+    @patch('swasd.algorithm.MonotoneSWDModel')
+    @patch('swasd.algorithm.rhat_check')
+    def test_full_pipeline_2d(self, mock_rhat, mock_model_class):
+        """Test full pipeline with 2D samples."""
+        # Rhat never converges
+        mock_rhat.return_value = (False, 500, 2.0)
+        
+        # SWD converges eventually
+        mock_model = Mock()
+        call_count = [0]
+        
+        def fake_fit(*args, **kwargs):
+            call_count[0] += 1
+            # Converge on 3rd call
+            if call_count[0] >= 3:
+                return {"swd_est_mean": np.array([2.0, 1.5, 1.0, 0.8, 0.5, 0.3])}
+            else:
+                return {"swd_est_mean": np.array([5.0, 4.0, 3.5, 3.0, 2.5, 2.0])}
+        
+        mock_model.fit_and_estimate.side_effect = fake_fit
+        mock_model.predicted_vs_residual.return_value = {
+            "y_predicted": np.array([1.0]),
+            "residuals": np.array([0.0]),
+        }
+        mock_model_class.return_value = mock_model
+        
+        samples = np.random.randn(1500, 5)
+        result = swasd(samples, n_blocks=6, min_iters_per_block=100, 
+                      convg_threshold=1.0, verbose=0)
+        
+        assert result["k_conv"] is not None
+        assert result["convergence_reason"] == "swd"
+        assert len(result["swd_to_stationary"]) >= 3
+    
+    @patch('swasd.algorithm.MonotoneSWDModel')
+    @patch('swasd.algorithm.rhat_check')
+    def test_full_pipeline_3d(self, mock_rhat, mock_model_class):
+        """Test full pipeline with 3D samples (multiple chains)."""
+        mock_rhat.return_value = (True, 500, 1.05)
+        
+        samples = np.random.randn(4, 1000, 5)
+        result = swasd(samples, n_blocks=6, min_iters_per_block=100, verbose=0)
+        
+        assert result["k_conv"] is not None
+        assert result["convergence_reason"] == "rhat"
 
-    _KW = dict(n_blocks=6, min_iters_per_block=50,
-               rhat_wmin=99999, convg_threshold=100.0)
 
-    @patch(P_BLOCKWISE, side_effect=_blockwise_result)
-    @patch(P_FIT_EST,   side_effect=_fit_and_estimate)
-    @patch(P_PVSR,      side_effect=_predicted_vs_residual)
-    def test_verbose_true_produces_output(self, _mock_pvsr, _mock_fit, _mock_bw, capsys):
-        swasd(self._samples(), verbose=True, **self._KW).run()
-        out = capsys.readouterr().out
-        assert len(out) > 0
+# ==============================================================================
+# Test Edge Cases
+# ==============================================================================
 
-    @patch(P_BLOCKWISE, side_effect=_blockwise_result)
-    @patch(P_FIT_EST,   side_effect=_fit_and_estimate)
-    @patch(P_PVSR,      side_effect=_predicted_vs_residual)
-    def test_verbose_false_is_silent(self, _mock_pvsr, _mock_fit, _mock_bw, capsys):
-        swasd(self._samples(), verbose=False, **self._KW).run()
-        out = capsys.readouterr().out
-        assert out == ""
+class TestEdgeCases:
+    """Test edge cases and boundary conditions."""
+    
+    def test_minimum_viable_input(self):
+        """Test with minimum viable input size."""
+        with patch('swasd.algorithm.convergence_check') as mock_check:
+            mock_check.return_value = (None, None)
+            
+            samples = np.random.randn(500, 2)
+            result = swasd(samples, n_blocks=2, min_iters_per_block=50, verbose=0)
+            assert result is not None
+    
+    def test_single_dimension(self):
+        """Test with single parameter dimension."""
+        with patch('swasd.algorithm.convergence_check') as mock_check:
+            mock_check.return_value = (None, None)
+            
+            samples = np.random.randn(1000, 1)
+            result = swasd(samples, n_blocks=4, min_iters_per_block=50, verbose=0)
+            assert result is not None
+    
+    def test_many_blocks(self):
+        """Test with many blocks."""
+        with patch('swasd.algorithm.convergence_check') as mock_check:
+            mock_check.return_value = (None, None)
+            
+            samples = np.random.randn(2000, 3)
+            result = swasd(samples, n_blocks=20, min_iters_per_block=50, verbose=0)
+            assert result is not None
 
+
+# ==============================================================================
+# Test History Dictionary
+# ==============================================================================
+
+class TestHistoryOutput:
+    """Test the structure and content of the returned history dict."""
+    
+    @patch('swasd.algorithm.convergence_check')
+    def test_history_structure_no_convergence(self, mock_check):
+        """Test history dict when no convergence."""
+        def mock_convergence(*args, **kwargs):
+            history = kwargs['history']
+            # Simulate what convergence_check adds to history
+            if kwargs.get('do_swd_check'):
+                history['pairwise_swd_results'].append({})
+                history['estimated_swd_results'].append({})
+                history['regression_results'].append({})
+                history['swd_to_stationary'].append(2.0)
+                xk = args[0]
+                k = xk.shape[0] if xk.ndim == 2 else xk.shape[1]
+                history['convg_check_iterate'].append(k)
+            return (None, None)
+        
+        mock_check.side_effect = mock_convergence
+        
+        samples = np.random.randn(1000, 3)
+        result = swasd(samples, n_blocks=4, min_iters_per_block=50, verbose=0)
+        
+        assert isinstance(result, dict)
+        assert result["k_conv"] is None
+        assert "pairwise_swd_results" in result
+        assert "estimated_swd_results" in result
+        assert "regression_results" in result
+        assert "swd_to_stationary" in result
+        assert "convg_check_iterate" in result
+    
+    @patch('swasd.algorithm.convergence_check')
+    def test_history_with_rhat(self, mock_check):
+        """Test history includes Rhat data when checked."""
+        def mock_convergence(*args, **kwargs):
+            history = kwargs['history']
+            xk = args[0]
+            k = xk.shape[0] if xk.ndim == 2 else xk.shape[1]
+        
+            if kwargs.get('do_rhat_check'):
+                history['rhat_best'].append(2.0)
+                history['rhat_check_iterate'].append(k)
+                history['rhat_best_w'].append(500)
+            return (None, None)
+        
+        mock_check.side_effect = mock_convergence
+        
+        samples = np.random.randn(4, 1000, 5)
+        result = swasd(samples, n_blocks=4, min_iters_per_block=50, verbose=0)
+        
+        assert "rhat_best" in result
+        assert "rhat_check_iterate" in result
+        assert len(result["rhat_best"]) > 0  # At least some Rhat checks
 
 
 if __name__ == "__main__":
