@@ -20,14 +20,52 @@ DEFAULT_COLORS = {
     "threshold": _SNS_COLORS[7] if len(_SNS_COLORS) > 7 else _SNS_COLORS[-1],
 }
 
+def _history_idx(history: dict, which: str = "auto") -> int:
+    """
+    Choose which SWD check to plot from history.
+
+    which:
+      - "auto": converged checkpoint if available, else last
+      - "converged": require convergence; error if not converged
+      - "last": last available checkpoint
+    """
+    est_list = history.get("estimated_swd_results", [])
+    if len(est_list) == 0:
+        raise ValueError("history['estimated_swd_results'] is empty. Nothing to plot.")
+
+    if which not in {"auto", "converged", "last"}:
+        raise ValueError("which must be one of {'auto','converged','last'}")
+
+    if which == "last":
+        return len(est_list) - 1
+
+    k_conv = history.get("k_conv", None)
+    iters = history.get("convg_check_iterate", [])
+
+    if k_conv is None:
+        if which == "converged":
+            raise ValueError("Requested which='converged' but history['k_conv'] is None.")
+        # auto fallback
+        return len(est_list) - 1
+
+    if not iters:
+        # No iterate record; fall back to last
+        return len(est_list) - 1
+
+    matches = [i for i, kk in enumerate(iters) if kk == k_conv]
+    if matches:
+        return matches[-1]
+
+    # If k_conv exists but doesn't match an iterate entry, fall back
+    return len(est_list) - 1
+
+
 def swd_comparison_plot(
-    swd_estimated: np.ndarray,
-    swd_true: np.ndarray,
+    history: dict,
     ax: Optional[plt.Axes] = None,
-    xlog: bool = False,
-    ylog: bool = False,
+    xlog: bool = True,
+    ylog: bool = True,
     add_diagonal: bool = True,
-    title: Optional[str] = None,
     **kwargs
 ) -> Tuple[plt.Figure, plt.Axes]:
     """
@@ -35,10 +73,8 @@ def swd_comparison_plot(
     
     Parameters
     ----------
-    swd_estimated : np.ndarray or dict
-        Estimated SWD values. Can be array or dict with 'swd_est_mean' key.
-    swd_true : np.ndarray or dict
-        True SWD values. Can be array or dict with 'mean_all' key.
+    history : dict
+        SWASD results dictionary
     ax : matplotlib.axes.Axes, optional
         Existing axes to plot on. If None, creates new figure.
     xlog : bool, default=False
@@ -47,42 +83,23 @@ def swd_comparison_plot(
         Use log scale for y-axis.
     add_diagonal : bool, default=True
         Add y=x diagonal reference line.
-    title : str, optional
-        Plot title.
-    figsize : tuple, default=(8, 6)
-        Figure size if creating new figure.
     **kwargs
         Additional keyword arguments passed to scatter plot.
-        
-    Returns
-    -------
-    fig : matplotlib.figure.Figure
-        Figure object.
-    ax : matplotlib.axes.Axes
-        Axes object.
-        
-    Examples
-    --------
-    >>> fig, ax = swd_comparison_plot(estimated, true, xlog=True, ylog=True)
-    >>> ax.set_title("My Custom Title")
-    >>> plt.savefig("comparison.png", dpi=300, bbox_inches='tight')
     """
-    # Handle dict inputs
-    if isinstance(swd_estimated, dict):
-        swd_est_vals = swd_estimated.get('swd_est_mean', swd_estimated.get('mean', None))
-        swd_est_vals = np.asarray(swd_est_vals)
-        if swd_est_vals is None:
-            raise ValueError("Dict must contain 'swd_est_mean' or 'mean' key")
-    else:
-        swd_est_vals = np.asarray(swd_estimated)
     
-    if isinstance(swd_true, dict):
-        swd_true_vals = swd_true.get('mean_all', swd_true.get('mean', None))
-        swd_true_vals = np.asarray(swd_true_vals)
-        if swd_true_vals is None:
-            raise ValueError("Dict must contain 'mean_all' or 'mean' key")
-    else:
-        swd_true_vals = np.asarray(swd_true)
+    idx = _history_idx(history)
+
+    est = history["estimated_swd_results"][idx]
+    swd_est_vals = np.asarray(est["swd_est_mean"], dtype=float)
+    
+    true_list = history.get("true_swd_results", [])
+    if len(true_list) == 0:
+        raise ValueError(
+            "history['true_swd_results'] is empty. "
+            "Run check_* with true_samples=... to enable SWD comparison."
+        )
+    tru = true_list[idx]
+    swd_true_vals = np.asarray(tru["mean_all"], dtype=float)
     
     # Validate shapes
     if swd_est_vals.shape != swd_true_vals.shape:
@@ -139,42 +156,29 @@ def swd_comparison_plot(
     ax.set_xlabel(r'$\mathrm{SWD}(\pi_{(i)}, \pi)$')
     ax.set_ylabel(r'$\widehat{\mathrm{SWD}}(\pi_{(i)}, \pi)$')
     
-    if title:
-        ax.set_title(title, fontsize=14, fontweight='bold')
-    
-    # Improve tick labels
     ax.tick_params(axis='x', rotation=45)
     plt.setp(ax.get_xticklabels(), ha='right')
     
-    # ax.grid(True, alpha=0.3)
-    fig.tight_layout()
+    # fig.tight_layout()
     
     return fig, ax
 
 
 def regression_diagnostic_plot(
-    pairwise_results: Dict[str, Any],
-    regression_results: Dict[str, Any],
+    history: dict,
     num_blocks: int = 6,
     ax: Optional[plt.Axes] = None,
     skip_first_block: bool = True,
     show_ci: bool = True,
     xlog: bool = False,
-    title: Optional[str] = None,
 ) -> Tuple[plt.Figure, plt.Axes]:
     """
     Plot regression fit vs observed pairwise SWD values.
     
     Parameters
     ----------
-    pairwise_results : dict
-        Results from pairwise SWD computation with keys:
-        - 'mean_all': observed SWD values
-        - 'block_pair': list of (i, j) tuples
-    regression_results : dict
-        Results from regression with keys:
-        - 'y_predicted': predicted log-SWD values
-        - 'upper_CI', 'lower_CI': confidence intervals (optional)
+    history : dict
+        SWASD results dictionary
     num_blocks : int, default=6
         Total number of blocks.
     ax : matplotlib.axes.Axes, optional
@@ -185,11 +189,12 @@ def regression_diagnostic_plot(
         Show confidence intervals.
     xlog : bool, default=False
         Use log scale for x-axis (pair indices).
-    title : str, optional
-        Plot title.
-    figsize : tuple, default=(10, 6)
-        Figure size if creating new figure.
     """
+    idx = _history_idx(history)
+
+    pairwise_results = history["pairwise_swd_results"][idx]
+    regression_results = history["regression_results"][idx]
+    
     # Create figure if needed
     if ax is None:
         fig, ax = plt.subplots()
@@ -235,14 +240,9 @@ def regression_diagnostic_plot(
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=45, ha='right')
     
-    if title:
-        ax.set_title(title, fontsize=14, fontweight='bold')
-    
     ax.legend(loc='upper center', 
                    bbox_to_anchor=(0.5, 1.2), ncol=3)
-    # ax.grid(True, alpha=0.3, axis='y')
-    
-    fig.tight_layout()
+    # fig.tight_layout()
     
     return fig, ax
 
@@ -253,19 +253,13 @@ def convergence_plot(
     ax: Optional[plt.Axes] = None,
     show_true_swd: bool = True,
     show_ci: bool = True,
-    xlog: bool = False,
-    ylog: bool = False,
+    xlog: bool = True,
+    ylog: bool = True,
     mark_convergence: bool = True,
     title: Optional[str] = None,
 ) -> Tuple[plt.Figure, plt.Axes]:
     """
-    Plot SWD convergence over iterations.
-    
-    Improved features:
-    - Handles both estimated and true SWD
-    - Optional convergence marker
-    - Better legend positioning
-    - Flexible data extraction
+    Plot SWD convergence over iterations
     
     Parameters
     ----------
@@ -291,13 +285,6 @@ def convergence_plot(
         Mark convergence point if detected.
     title : str, optional
         Plot title.
-    figsize : tuple, default=(10, 6)
-        Figure size.
-        
-    Returns
-    -------
-    fig : matplotlib.figure.Figure
-    ax : matplotlib.axes.Axes
     """
     if ax is None:
         fig, ax = plt.subplots()

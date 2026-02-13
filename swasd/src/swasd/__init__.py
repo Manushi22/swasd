@@ -1,4 +1,4 @@
-from .algorithm import swasd
+from .algorithm import check_is_converged, check_where_converged
 from .metrics import MetricComputer
 from .regression import MonotoneSWDModel
 from .utils import (
@@ -8,7 +8,8 @@ from .utils import (
 
 __all__ = [
     # driver
-    "swasd",
+    "check_is_converged",
+    "check_where_converged",
     # metrics
     "MetricComputer",
     # regression
