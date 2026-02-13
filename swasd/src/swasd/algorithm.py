@@ -76,8 +76,26 @@ def _print_summary(history, k_conv, reason, rhat_threshold=None, swd_threshold=N
 
     print("=" * 60)
 
+def _init_history():
+    return {
+        "k_conv": None,
+        "convergence_reason": None,
 
-def convergence_check(
+        "rhat_check_iterate": [],
+        "rhat_best_w": [],
+        "rhat_best": [],
+
+        "pairwise_swd_results": [],
+        "true_swd_results": [],
+
+        "estimated_swd_results": [],
+        "regression_results": [],
+
+        "swd_to_stationary": [],
+        "convg_check_iterate": [],
+    }
+
+def _check_is_converged_step(
     samples,
     *,
     do_rhat_check,
@@ -88,7 +106,6 @@ def convergence_check(
     block_mode="all_pairs",
     wo_init_block=True,
     convg_threshold=1.0,
-    true_swd=False,
     true_samples=None,
     rhat_threshold=1.01,
     rhat_wmin=200,
@@ -142,7 +159,7 @@ def convergence_check(
         )
         history["pairwise_swd_results"].append(swd_results)
 
-        if true_swd:
+        if true_samples is not None:
             swd_true_results = metric_comp.compute_blockwise(
                 samples,
                 metric="swd",
@@ -200,8 +217,104 @@ def convergence_check(
 
     return None, None
 
+def check_is_converged(
+    samples,
+    *,
+    n_blocks=6,
+    n_projections=250,
+    n_bootstrap=10,
+    block_mode="all_pairs",
+    wo_init_block=True,
+    min_iters_per_block=250,
+    convg_threshold=1.0,
+    true_samples=None,
+    rhat_threshold=1.01,
+    rhat_wmin=200,
+    rhat_method="rank",
+    rhat_num_windows=5,
+    metric_comp=None,
+    verbose=2,
+):
+    
+    history = _init_history()
+    if metric_comp is None:
+        metric_comp = MetricComputer(n_projections, n_bootstrap)
+    
+    k = samples.shape[0] if samples.ndim == 2 else samples.shape[1]
+    min_k_for_swd = int(min_iters_per_block * n_blocks)
+    
+    use_rhat = k < min_k_for_swd
+    do_rhat_check = use_rhat
+    do_swd_check = not use_rhat
+    
+    if verbose >= 1:
+        if use_rhat:
+            print(
+                f"[SWASD] k={k} < {min_k_for_swd} (= min_iters_per_block*n_blocks). "
+                f"Running R-hat only (windows start at {rhat_wmin})."
+            )
+        else:
+            print(
+                f"[SWASD] k={k} >= {min_k_for_swd} (= min_iters_per_block*n_blocks). "
+                f"Running SWASD only (n_blocks={n_blocks}, threshold={convg_threshold})."
+            )
+    k_conv, reason = _check_is_converged_step(
+        samples,
+        do_rhat_check=do_rhat_check,
+        do_swd_check=do_swd_check,
+        history=history,
+        metric_comp=metric_comp,
+        n_blocks=n_blocks,
+        block_mode=block_mode,
+        wo_init_block=wo_init_block,
+        convg_threshold=convg_threshold,
+        true_samples=true_samples,
+        rhat_threshold=rhat_threshold,
+        rhat_wmin=rhat_wmin,
+        rhat_method=rhat_method,
+        rhat_num_windows=rhat_num_windows,
+        verbose=verbose,
+    )
 
-def swasd(
+    ok = (k_conv is not None)
+    
+    if verbose >= 1:
+        if ok:
+            # summarize key stat depending on reason
+            if reason == "rhat":
+                best_rhat = history["rhat_best"][-1] if history["rhat_best"] else None
+                best_w = history["rhat_best_w"][-1] if history["rhat_best_w"] else None
+                msg = f"Converged at k={k_conv} via R-hat"
+                if best_rhat is not None:
+                    msg += f"(best R-hat={best_rhat:.3f} at w={best_w})."
+                print(msg)
+            elif reason == "swd":
+                last_swd = history["swd_to_stationary"][-1] if history["swd_to_stationary"] else None
+                msg = f"Converged at k={k_conv} via SWD"
+                if last_swd is not None:
+                    msg += f"(estimated final distance={last_swd:.4g} < {convg_threshold})."
+                print(msg)
+            else:
+                print(f"Converged at k={k_conv}.")
+        else:
+            # print a helpful “closest value” message
+            if use_rhat:
+                if history["rhat_best"]:
+                    best_rhat = history["rhat_best"][-1]
+                    print(f"Not converged (R-hat best={best_rhat:.3f}, threshold={rhat_threshold}).")
+                else:
+                    print("Not converged (insufficient k for R-hat windows).")
+            else:
+                if history["swd_to_stationary"]:
+                    last_swd = history["swd_to_stationary"][-1]
+                    print(f"Not converged (estimated final distance={last_swd:.4g}, threshold={convg_threshold}).")
+                else:
+                    print("Not converged (SWD check did not run).")
+
+    return history
+    
+
+def check_where_converged(
     samples,
     n_iters=None,
     n_blocks=6,
@@ -213,7 +326,6 @@ def swasd(
     block_mode="all_pairs",
     wo_init_block=True,
     diagnostic=True,
-    true_swd=False,
     true_samples=None,
     rhat_threshold=1.01,
     rhat_wmin=100,
@@ -255,8 +367,6 @@ def swasd(
         Exclude any pair involving block 1 from regression fit. Default: True.
     diagnostic : bool, optional
         Store regression fit and predicted-vs-residual diagnostics. Default: True.
-    true_swd : bool, optional
-        If True, compare each block to provided stationary samples (requires `true_samples`).
     true_samples : np.ndarray, optional
         Stationary samples if `true_swd=True`.
     verbose : bool or int, optional
@@ -281,8 +391,6 @@ def swasd(
         raise ValueError("check_rate should be > 1.0.")
     if block_mode not in {"all_pairs", "adjacent"}:
         raise ValueError("block_mode must be 'all_pairs' or 'adjacent'.")
-    if true_swd and true_samples is None:
-        raise ValueError("true_swd=True requires `true_samples`.")
 
     if n_iters is None:
         n_iters = samples.shape[0] if samples.ndim == 2 else samples.shape[1]
@@ -291,8 +399,8 @@ def swasd(
         if n_iters > max_avail:
             raise ValueError("n_iters exceeds available iterations in `samples`.")
 
-    history = defaultdict(list)
-
+    # history = defaultdict(list)
+    history = _init_history()
     k0 = min_iters_per_block * n_blocks
     if k0 > n_iters:
         if verbose >= 1:
@@ -340,7 +448,7 @@ def swasd(
             
         xk = _slice_samples(samples, k)
         
-        k_conv, reason = convergence_check(
+        k_conv, reason = _check_is_converged_step(
             xk,
             do_rhat_check=do_rhat,
             do_swd_check=do_swd,
@@ -350,7 +458,6 @@ def swasd(
             block_mode=block_mode,
             wo_init_block=wo_init_block,
             convg_threshold=convg_threshold,
-            true_swd=true_swd,
             true_samples=true_samples,
             rhat_threshold=rhat_threshold,
             rhat_wmin=rhat_wmin,
