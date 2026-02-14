@@ -66,8 +66,9 @@ def swd_comparison_plot(
     xlog: bool = True,
     ylog: bool = True,
     add_diagonal: bool = True,
+    savepath: str = None,
     **kwargs
-) -> Tuple[plt.Figure, plt.Axes]:
+):
     """
     Plot comparison between estimated and true SWD values.
     
@@ -159,6 +160,8 @@ def swd_comparison_plot(
     ax.tick_params(axis='x', rotation=45)
     plt.setp(ax.get_xticklabels(), ha='right')
     
+    if savepath is not None:
+        fig.savefig(savepath, bbox_inches="tight")
     # fig.tight_layout()
     
     return fig, ax
@@ -171,7 +174,8 @@ def regression_diagnostic_plot(
     skip_first_block: bool = True,
     show_ci: bool = True,
     xlog: bool = False,
-) -> Tuple[plt.Figure, plt.Axes]:
+    savepath: str = None,
+):
     """
     Plot regression fit vs observed pairwise SWD values.
     
@@ -243,6 +247,8 @@ def regression_diagnostic_plot(
     ax.legend(loc='upper center', 
                    bbox_to_anchor=(0.5, 1.2), ncol=3)
     # fig.tight_layout()
+    if savepath is not None:
+        fig.savefig(savepath, bbox_inches="tight")
     
     return fig, ax
 
@@ -257,7 +263,8 @@ def convergence_plot(
     ylog: bool = True,
     mark_convergence: bool = True,
     title: Optional[str] = None,
-) -> Tuple[plt.Figure, plt.Axes]:
+    savepath: str = None
+):
     """
     Plot SWD convergence over iterations
     
@@ -333,13 +340,7 @@ def convergence_plot(
     ax.axhline(threshold, linestyle=':', color=DEFAULT_COLORS['threshold'],
               alpha=0.8, linewidth=2,
               label=f'$\\varepsilon={threshold:.2f}$')
-    
-    # Mark convergence
-    # if mark_convergence and 'k_conv' in history and history['k_conv'] is not None:
-    #     k_conv = history['k_conv']
-    #     ax.axvline(k_conv, linestyle='--', color=DEFAULT_COLORS['success'],
-    #               alpha=0.7, linewidth=2, label=f'Convergence (k={k_conv})')
-    
+        
     # Formatting
     ax.set_xlabel('Iteration')
     ax.set_ylabel('Diagnostic Value')
@@ -357,6 +358,8 @@ def convergence_plot(
     ax.tick_params(axis='x', rotation=45)
     
     # fig.tight_layout()
+    if savepath is not None:
+        fig.savefig(savepath, bbox_inches="tight")
     
     return fig, ax
 
@@ -369,7 +372,8 @@ def trace_plot(
     xlog: bool = False,
     max_dims: int = 5,
     title: Optional[str] = None,
-) -> Tuple[plt.Figure, plt.Axes]:
+    savepath: str = None
+):
     """
     Plot parameter traces over iterations.
     
@@ -444,114 +448,7 @@ def trace_plot(
     if title:
         ax.set_title(title, fontsize=14, fontweight='bold')
     
-    fig.tight_layout()
+    if savepath is not None:
+        fig.savefig(savepath, bbox_inches="tight")
     
     return fig, ax
-
-# set_plot_style()
-
-
-
-
-
-
-
-
-
-# import numpy as np
-# import matplotlib.pyplot as plt
-# from matplotlib.ticker import LogLocator
-# import seaborn as sns
-
-# colors = sns.color_palette("colorblind")
-
-# def swd_est_true_comparison_plot(swd_estimated_convg_results,
-#                                  swd_true_convg_results,
-#                                  xlog=False, ylog=False):
-#     swd_est_mean = swd_estimated_convg_results["swd_est_mean"]
-#     swd_true = swd_true_convg_results["mean_all"]
-    
-#     plt.scatter(swd_true, swd_est_mean, color=colors[0])
-#     plt.plot(swd_true, swd_true, linestyle="--", color="red")
-#     if xlog:
-#         plt.xscale("log")
-#     if ylog:
-#         plt.yscale("log")
-#     plt.xlabel(r"$SWD(\pi_{(i)},\pi)$")
-#     plt.ylabel(r"$\widehat{SWD}(\pi_{(i)},\pi)$")
-#     subs = np.arange(1, 10)
-#     plt.gca().xaxis.set_major_locator(LogLocator(base=10.0, subs=subs, numticks=12))
-#     plt.xticks(rotation=45, ha="right")
-#     plt.show()
-#     plt.close()
-
-# def regression_true_vs_fitted_plot(swd_pairwise_convg_results,
-#                                    swd_regression_convg_results,
-#                                    num_blocks = 6,
-#                                    xlog=True, xlabel=None, label=None):
-#     index = num_blocks - 1
-#     y_true = swd_pairwise_convg_results["mean_all"][index:]
-#     y_pred = np.exp(swd_regression_convg_results["y_predicted"])
-#     y_pred_uci = np.exp(swd_regression_convg_results["upper_CI"])
-#     y_pred_lci = np.exp(swd_regression_convg_results["lower_CI"])
-#     block_pairs = np.array(swd_pairwise_convg_results["block_pair"])[index:]
-#     pairs = np.asarray(block_pairs)
-    
-#     labels = [f"{i}-{j}" for i, j in pairs]
-#     x = np.arange(len(labels))
-    
-#     plt.scatter(x, y_true, alpha=1, color=colors[0])
-#     plt.scatter(x, y_pred, alpha=1, color=colors[3], marker="x")#, label=label)
-#     plt.vlines(x, y_pred_lci, y_pred_uci, color=colors[3], 
-#                 linestyle="--")
-#     if xlabel is not None:
-#         plt.xlabel(xlabel)
-#     else:   
-#         plt.xlabel("Block Pairs")
-#     plt.ylabel(r"$SWD(\hat{\pi}_{(i)}, \hat{\pi}_{(j)})$")
-#     if xlog:
-#         plt.xscale("log")
-#     plt.yscale("log")
-#     plt.xticks(x, labels, rotation=45, ha="right")
-#     plt.title(label=label)
-#     plt.show()
-#     plt.close()
-
-# def swd_est_plot(results, iterations,
-#                   conv_threshld=1.0, xlog=False, ylog=False):
-    
-#     swd_est_mean = [results['estimated_swd_results'][i]["swd_est_mean"][-1] for i in range(len(iterations))]
-#     swd_est_lci = [results['estimated_swd_results'][i]["swd_lci"][-1] for i in range(len(iterations))]
-#     swd_est_uci = [results['estimated_swd_results'][i]["swd_uci"][-1] for i in range(len(iterations))]
-#     swd_true = [results['true_swd_results'][i]["mean_all"][-1] for i in range(len(iterations))]
-    
-#     plt.plot(iterations, swd_true, color=colors[0], label=r"$SWD(\pi_{(B)},\pi)$", linewidth=2)
-#     plt.plot(iterations, swd_est_mean, color=colors[9], linestyle="--", label=r"$\widehat{SWD}(\pi_{(B)},\pi)$")
-#     plt.fill_between(iterations, swd_est_lci, swd_est_uci, color=colors[9], alpha=0.25)
-
-#     plt.axhline(conv_threshld, linestyle="dashed", color="black", alpha=0.6, 
-#                 label=r"$\varepsilon={:.2f}$".format(conv_threshld))
-#     plt.xticks(rotation=45, ha="right")
-#     if xlog:
-#         plt.xscale("log")
-#     if ylog:
-#         plt.yscale("log")
-#     plt.xlabel("Iteration")
-#     plt.ylabel("Diagnostic Value")
-#     plt.legend(loc='upper center', 
-#                bbox_to_anchor=(0.5, 1.3), ncol=2, 
-#                frameon=False)
-#     plt.show()
-#     plt.close()
-
-# def plot_iterate_trace(X, dims=(0, 1, 2, 3, 4), k_conv=None, xlog=True):
-#     plt.figure()
-#     for j in dims:
-#         plt.plot(X[:, j], linewidth=1.3, label=f"dim {j}")
-#     if k_conv is not None:
-#         plt.axvline(k_conv, linestyle="--", linewidth=2, label=f"k_conv={k_conv}")
-#     plt.xlabel("iteration")
-#     plt.ylabel("value")
-#     if xlog:
-#         plt.xscale('log')
-#     plt.show()
