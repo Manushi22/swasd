@@ -105,18 +105,23 @@ class MetricComputer:
             blocks = np.array_split(samples, num_blocks)
         else:
             raise ValueError("samples must be 2D")
-        scale = compute_scale_from_last_blocks(samples, num_blocks)
-        rescaled = [b / scale for b in blocks]
+        eps = 1e-8
 
         if mode == "true":
             if ref_samples is None:
                 raise ValueError("Reference stationary samples required for mode='true'")
+            true_std = np.std(ref_samples, axis=0)
+            scale = np.maximum(true_std, eps)
             ref = ref_samples / scale
             pairs = [(i, "S") for i in range(1, num_blocks + 1)]
         elif mode == "all_pairs":
+            scale = compute_scale_from_last_blocks(samples, num_blocks)
             pairs = list(itertools.combinations(range(1, num_blocks + 1), 2))
         else:
+            scale = compute_scale_from_last_blocks(samples, num_blocks)
             pairs = [(i, i + 1) for i in range(1, num_blocks)]
+
+        rescaled = [b / scale for b in blocks]
                 
         iterator = pairs 
         # if not verbose else tqdm(pairs, disable=not verbose)

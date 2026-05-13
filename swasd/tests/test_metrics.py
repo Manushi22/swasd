@@ -187,11 +187,45 @@ class TestMetricComputer:
     def test_compute_blockwise_true_mode_no_ref_samples(self, metric_computer):
         """Test that true mode without ref_samples raises error"""
         samples = np.random.randn(600, 3)
-        
+
         with pytest.raises(ValueError, match="Reference stationary samples required"):
             metric_computer.compute_blockwise(
                 samples, mode="true", ref_samples=None
             )
+
+    def test_compute_blockwise_true_mode_uses_ref_scale(self, metric_computer):
+        """mode='true' must derive scale from ref_samples std, not from chain samples.
+
+        When the chain has std ~10x larger than ref_samples, the oracle scale
+        (from ref) leaves blocks ~10 units wide relative to ref in the rescaled
+        space, producing large distances.  The old behaviour (scale from chain)
+        would shrink blocks back to unit width, giving small distances instead.
+        """
+        rng = np.random.default_rng(0)
+        ref = rng.standard_normal((1000, 3))  # std ~ 1 per dimension
+
+        # Chain with same scale as ref -> distances should be small
+        samples_unit = rng.standard_normal((600, 3))
+        result_unit = metric_computer.compute_blockwise(
+            samples_unit, metric="swd", num_blocks=6, mode="true",
+            ref_samples=ref, verbose=False, seed=42,
+        )
+
+        # Chain with scale ~10x larger than ref -> oracle scale ~ 1, so
+        # rescaled blocks ~ N(0,10) while rescaled ref ~ N(0,1): large distance
+        samples_large = rng.standard_normal((600, 3)) * 10.0
+        result_large = metric_computer.compute_blockwise(
+            samples_large, metric="swd", num_blocks=6, mode="true",
+            ref_samples=ref, verbose=False, seed=42,
+        )
+
+        mean_unit = np.mean(result_unit["est_all"])
+        mean_large = np.mean(result_large["est_all"])
+        assert mean_large > mean_unit * 5, (
+            f"Expected large-scale chain to give distances >5x unit-scale chain "
+            f"(got {mean_large:.4f} vs {mean_unit:.4f}); "
+            "scale may not be coming from ref_samples."
+        )
 
     def test_compute_blockwise_3d_samples_raises_error(self, metric_computer):
         """Test that 3D samples raise error"""
